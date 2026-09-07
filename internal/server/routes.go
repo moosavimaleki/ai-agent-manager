@@ -46,6 +46,7 @@ func setupRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/telegram/test", handleAPITelegramTest)
 	mux.HandleFunc("/api/hook", handleAPIHook)
 	mux.HandleFunc("/api/session/", handleAPISessionMessages)
+	mux.HandleFunc("/api/chats/", handleAPIChatRefresh)
 	mux.HandleFunc("/api/file-preview", handleAPIFilePreview)
 	mux.HandleFunc("/api/file-context", handleAPIFileContext)
 	mux.HandleFunc("/api/projects/", handleAPIProjects)

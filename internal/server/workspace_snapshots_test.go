@@ -33,6 +33,37 @@ func withWorkspaceSnapshotStore(t *testing.T) *eventstore.Store {
 	return eventstore.New(dir)
 }
 
+func TestWorkspaceBoundTranscriptSnapshotPayloadKeepsNewestEntriesWithinBudget(t *testing.T) {
+	entries := []readmodels.TranscriptEntry{
+		{"_id": "old", "text": strings.Repeat("a", 120)},
+		{"_id": "middle", "text": strings.Repeat("b", 120)},
+		{"_id": "new", "text": strings.Repeat("c", 40)},
+	}
+
+	bounded, omitted := workspaceBoundTranscriptSnapshotPayload(entries, 200)
+	if omitted != 2 {
+		t.Fatalf("expected two omitted entries, got %d", omitted)
+	}
+	if len(bounded) != 1 || bounded[0]["_id"] != "new" {
+		t.Fatalf("expected newest entry only, got %#v", bounded)
+	}
+}
+
+func TestWorkspaceBoundTranscriptSnapshotPayloadRetainsNewestOversizedEntry(t *testing.T) {
+	entries := []readmodels.TranscriptEntry{
+		{"_id": "old", "text": "small"},
+		{"_id": "new", "text": strings.Repeat("x", 1024)},
+	}
+
+	bounded, omitted := workspaceBoundTranscriptSnapshotPayload(entries, 100)
+	if omitted != 1 {
+		t.Fatalf("expected old entry to be omitted, got %d", omitted)
+	}
+	if len(bounded) != 1 || bounded[0]["_id"] != "new" {
+		t.Fatalf("expected newest oversized entry to remain visible, got %#v", bounded)
+	}
+}
+
 func TestWorkspaceSidebarAndLocalProjectsSnapshotsComeFromEventStore(t *testing.T) {
 	store := withWorkspaceSnapshotStore(t)
 	appendWorkspaceEvent(t, store, events.StreamProjects, events.TypeProjectOpened, 100, map[string]any{

@@ -13,9 +13,6 @@ import (
 // These mirror the original Codex Manager defaults. The persisted settings
 // below may change them while the server remains running.
 const (
-	// Account balances drive the recommendation and should not sit stale for an
-	// hour. This cadence is intentionally owned by Abolqasem rather than being
-	// another user-facing scheduler setting.
 	codexManagerMaintenanceInterval = 15 * time.Minute
 	codexManagerMaintenanceJitter   = 5 * time.Minute
 	codexManagerHistoryRetention    = 90 * 24 * time.Hour
@@ -23,6 +20,7 @@ const (
 )
 
 var newCodexManagerMaintenanceManager = codexmanager.New
+var loadCodexManagerMaintenanceSettings = state.LoadSettings
 
 var codexManagerMaintenanceRuntime = struct {
 	sync.RWMutex
@@ -81,18 +79,27 @@ type codexManagerMaintenanceConfig struct {
 }
 
 func loadCodexManagerMaintenanceConfig() codexManagerMaintenanceConfig {
-	settings, err := state.LoadSettings()
+	settings, err := loadCodexManagerMaintenanceSettings()
 	if err != nil {
 		settings = state.DefaultAppSettings()
 	}
 	value := settings.CodexBackend.Maintenance
+	interval := time.Duration(value.IntervalSeconds) * time.Second
+	if interval < 5*time.Minute || interval > 7*24*time.Hour {
+		interval = codexManagerMaintenanceInterval
+	}
+	jitter := time.Duration(value.JitterSeconds) * time.Second
+	if jitter < 0 || jitter > time.Hour || jitter > interval {
+		jitter = 0
+	}
+	retention := time.Duration(value.RetentionDays) * 24 * time.Hour
+	if retention <= 0 {
+		retention = codexManagerHistoryRetention
+	}
 	return codexManagerMaintenanceConfig{
-		Interval: codexManagerMaintenanceInterval,
-		// These operational details are intentionally not user settings. The
-		// account dashboard promises a fifteen-minute cadence, so this worker
-		// uses no jitter; history remains bounded to ninety days.
-		Jitter:    0,
-		Retention: codexManagerHistoryRetention,
+		Interval:  interval,
+		Jitter:    jitter,
+		Retention: retention,
 		ProxyURL:  value.ProxyURL,
 	}
 }

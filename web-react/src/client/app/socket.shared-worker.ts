@@ -15,17 +15,28 @@ interface SharedWorkerScopeLike {
 
 const RECONNECT_INITIAL_DELAY_MS = 750
 const RECONNECT_MAX_DELAY_MS = 5_000
+const CONNECT_TIMEOUT_MS = 4_000
+
+function isRetryableCommand(envelope: ClientEnvelope) {
+  if (envelope.type !== "command") return false
+  return envelope.command.type === "chat.send"
+    || envelope.command.type === "message.enqueue"
+    || envelope.command.type === "message.steer"
+    || envelope.command.type === "message.interrupt"
+}
 
 const workerScope = self as unknown as SharedWorkerScopeLike
 const ports = new Set<MessagePort>()
 const subscriptionOwners = new Map<string, MessagePort>()
 const commandOwners = new Map<string, MessagePort>()
+const retryableCommands = new Map<string, ClientEnvelope>()
 const subscriptions = new Map<string, ClientEnvelope>()
 const outboundQueue: ClientEnvelope[] = []
 
 let socket: WebSocket | null = null
 let socketURL = ""
 let reconnectTimer: number | null = null
+let connectTimeoutTimer: number | null = null
 let reconnectDelayMs = RECONNECT_INITIAL_DELAY_MS
 let status: SharedWorkerStatus = "disconnected"
 
@@ -52,6 +63,7 @@ function handlePortMessage(port: MessagePort, message: WorkerRequest) {
       return
     case "cancel-command":
       commandOwners.delete(message.id)
+      retryableCommands.delete(message.id)
       discardQueuedCommand(message.id)
       return
     case "reconnect":
@@ -77,6 +89,7 @@ function trackEnvelope(port: MessagePort, envelope: ClientEnvelope) {
   }
   if (envelope.type === "command") {
     commandOwners.set(envelope.id, port)
+    if (isRetryableCommand(envelope)) retryableCommands.set(envelope.id, envelope)
   }
 }
 
@@ -91,6 +104,7 @@ function disposePort(port: MessagePort) {
   for (const [commandID, owner] of commandOwners) {
     if (owner !== port) continue
     commandOwners.delete(commandID)
+    retryableCommands.delete(commandID)
     discardQueuedCommand(commandID)
   }
   port.close()
@@ -100,8 +114,26 @@ function disposePort(port: MessagePort) {
 function connect() {
   if (!socketURL || ports.size === 0 || socket?.readyState === WebSocket.OPEN || socket?.readyState === WebSocket.CONNECTING) return
   setStatus("connecting")
-  socket = new WebSocket(socketURL)
-  socket.addEventListener("open", () => {
+  const nextSocket = new WebSocket(socketURL)
+  socket = nextSocket
+  connectTimeoutTimer = setTimeout(() => {
+    connectTimeoutTimer = null
+    if (socket !== nextSocket || nextSocket.readyState !== WebSocket.CONNECTING) return
+
+    // Browsers may leave a local WebSocket in CONNECTING for minutes while a
+    // server binary is being replaced. Do not let that browser-level timeout
+    // hold the entire UI splash screen.
+    socket = null
+    nextSocket.close()
+    setStatus("disconnected")
+    scheduleReconnect()
+  }, CONNECT_TIMEOUT_MS) as unknown as number
+  nextSocket.addEventListener("open", () => {
+    if (socket !== nextSocket) {
+      nextSocket.close()
+      return
+    }
+    clearConnectTimeout()
     reconnectDelayMs = RECONNECT_INITIAL_DELAY_MS
     setStatus("connected")
     for (const envelope of subscriptions.values()) sendNow(envelope)
@@ -111,14 +143,24 @@ function connect() {
       sendNow(envelope)
     }
   })
-  socket.addEventListener("message", (event) => routeServerMessage(String(event.data)))
-  socket.addEventListener("close", () => {
+  nextSocket.addEventListener("message", (event) => {
+    if (socket === nextSocket) routeServerMessage(String(event.data))
+  })
+  nextSocket.addEventListener("close", () => {
+    if (socket !== nextSocket) return
+    clearConnectTimeout()
     socket = null
-    commandOwners.clear()
+    // Keep chat.send ownership and replay the exact same envelope after a
+    // local-server restart. Non-idempotent UI commands retain the old failure
+    // semantics and are allowed to be rejected by the page.
+    for (const envelope of retryableCommands.values()) enqueueRetryableCommand(envelope)
+    for (const [commandID] of commandOwners) {
+      if (!retryableCommands.has(commandID)) commandOwners.delete(commandID)
+    }
     setStatus("disconnected")
     scheduleReconnect()
   })
-  socket.addEventListener("error", () => socket?.close())
+  nextSocket.addEventListener("error", () => nextSocket.close())
 }
 
 function closeSocket() {
@@ -126,6 +168,7 @@ function closeSocket() {
     clearTimeout(reconnectTimer)
     reconnectTimer = null
   }
+  clearConnectTimeout()
   const currentSocket = socket
   socket = null
   currentSocket?.close()
@@ -138,11 +181,26 @@ function reconnectNow() {
     reconnectTimer = null
   }
   if (!socket || socket.readyState === WebSocket.CLOSED) {
+    queueRetryableCommands()
     connect()
     return
   }
-  if (socket.readyState === WebSocket.CONNECTING) return
-  socket.close()
+  clearConnectTimeout()
+  // We detach the old socket before closing it so its late events cannot
+  // affect the replacement. Queue pending deliveries here, because that same
+  // guard intentionally makes the old socket's close handler a no-op.
+  queueRetryableCommands()
+  const currentSocket = socket
+  socket = null
+  currentSocket.close()
+  setStatus("disconnected")
+  connect()
+}
+
+function clearConnectTimeout() {
+  if (connectTimeoutTimer === null) return
+  clearTimeout(connectTimeoutTimer)
+  connectTimeoutTimer = null
 }
 
 function scheduleReconnect() {
@@ -163,7 +221,11 @@ function send(envelope: ClientEnvelope) {
     connect()
     return
   }
-  outboundQueue.push(envelope)
+  if (isRetryableCommand(envelope)) {
+    enqueueRetryableCommand(envelope)
+  } else {
+    outboundQueue.push(envelope)
+  }
   connect()
 }
 
@@ -178,6 +240,15 @@ function discardQueuedCommand(commandID: string) {
   }
 }
 
+function enqueueRetryableCommand(envelope: ClientEnvelope) {
+  if (outboundQueue.some((queued) => queued.type === "command" && queued.id === envelope.id)) return
+  outboundQueue.push(envelope)
+}
+
+function queueRetryableCommands() {
+  for (const envelope of retryableCommands.values()) enqueueRetryableCommand(envelope)
+}
+
 function routeServerMessage(payload: string) {
   let envelope: ServerEnvelope
   try {
@@ -188,7 +259,10 @@ function routeServerMessage(payload: string) {
   if (!envelope.id) return
   const owner = envelope.type === "snapshot" || envelope.type === "event" ? subscriptionOwners.get(envelope.id) : commandOwners.get(envelope.id)
   if (!owner) return
-  if (envelope.type === "ack" || envelope.type === "error") commandOwners.delete(envelope.id)
+  if (envelope.type === "ack" || envelope.type === "error") {
+    commandOwners.delete(envelope.id)
+    retryableCommands.delete(envelope.id)
+  }
   post(owner, { type: "message", payload })
 }
 

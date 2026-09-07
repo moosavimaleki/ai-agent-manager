@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Check,
   CircleAlert,
@@ -19,21 +19,21 @@ import type { AppLocale } from "../../../shared/types";
 import { Button } from "../ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../ui/tooltip";
 
-type QuotaWindow = {
+export type QuotaWindow = {
   label: string;
   remainingPercent: number;
   resetAt?: string;
   resetAfterSeconds?: number;
   reached?: boolean;
 };
-type QuotaLimit = {
+export type QuotaLimit = {
   id: string;
   name?: string;
   limitReached?: boolean;
   windows: QuotaWindow[];
   credits?: { hasCredits?: boolean; unlimited?: boolean; balance?: string };
 };
-type Account = {
+export type Account = {
   name: string;
   email?: string;
   accountId?: string;
@@ -94,6 +94,8 @@ type BrowserProfile = {
   accounts?: Record<string, string>;
   outcome?: string;
   activeEmail?: string;
+  lastActiveEmail?: string;
+  lastManagedAccount?: string;
   managedAccount?: string;
 };
 type AccountChromeProfile = {
@@ -101,6 +103,8 @@ type AccountChromeProfile = {
   name: string;
   outcome?: string;
   activeEmail?: string;
+  lastActiveEmail?: string;
+  lastManagedAccount?: string;
   lastSeenAt?: string;
   lastCheckedAt?: string;
 };
@@ -108,6 +112,8 @@ type AccountSync = {
   error?: string;
   conflictingNames?: string[];
 };
+
+export const CODEX_MANAGER_AUTO_REFRESH_INTERVAL_MS = 5_000;
 
 const tr = (locale: AppLocale, fa: string, en: string) =>
   locale === "fa" ? fa : en;
@@ -166,7 +172,16 @@ function resetLabel(window: QuotaWindow, locale: AppLocale, now: number) {
   }
   return "";
 }
-function quotaWindowFor(
+function codexQuotaLimit(account: Account) {
+  return (account.rateLimits?.limits ?? []).find(
+    (limit) => limit.id.trim().toLowerCase() === "codex",
+  );
+}
+
+// The account table represents Codex availability, not an arbitrary auxiliary
+// product limit. In particular, gpt-reserve can have a separate weekly meter
+// even after the account's actual Codex weekly allowance is exhausted.
+export function quotaWindowFor(
   account: Account,
   kind: "weekly" | "fiveHour",
 ): QuotaWindow | undefined {
@@ -174,8 +189,7 @@ function quotaWindowFor(
     kind === "weekly"
       ? /week|weekly|هفته/i
       : /(^|[^\d])5\s*(h|hour|ساعت)|five.?hour/i;
-  return (account.rateLimits?.limits ?? [])
-    .flatMap((limit) => limit.windows ?? [])
+  return (codexQuotaLimit(account)?.windows ?? [])
     .find((window) => matcher.test(window.label));
 }
 function quotaPercent(window: QuotaWindow | undefined) {
@@ -203,6 +217,31 @@ function quotaListLabel(window: QuotaWindow | undefined, locale: AppLocale, now:
   return remaining === undefined
     ? `${Math.round(percent)}%`
     : `${Math.round(percent)}% · ${tr(locale, "تا ", "in ")}${compactDurationLabel(remaining, locale)}`;
+}
+function weeklyQuotaExhausted(window: QuotaWindow | undefined) {
+  const remaining = quotaPercent(window)
+  return Boolean(window?.reached || remaining === 0)
+}
+function fiveHourQuotaWindow(window: QuotaWindow) {
+  return /5\s*(?:h|hour|ساعت)|five\s*hour/i.test(window.label)
+}
+
+// Extra limits are useful diagnostics while Codex is available. Once the
+// actual Codex weekly allowance is exhausted they cannot make the account
+// usable, so showing a green gpt-reserve bar is misleading. Keep only the
+// decisive Codex weekly window in that state; when Codex is available every
+// extra limit remains visible.
+export function visibleQuotaLimits(account: Account) {
+  const weeklyExhausted = weeklyQuotaExhausted(quotaWindowFor(account, "weekly"));
+  return (account.rateLimits?.limits ?? [])
+    .filter((limit) => !weeklyExhausted || limit.id.trim().toLowerCase() === "codex")
+    .map((limit) => ({
+      ...limit,
+      windows: limit.windows.filter(
+        (window) => !weeklyExhausted || !fiveHourQuotaWindow(window),
+      ),
+    }))
+    .filter((limit) => limit.windows.length > 0);
 }
 function accountNeedsRelogin(account: Account, now: number) {
   if (account.state === "needs_login") return true;
@@ -253,6 +292,26 @@ function InfoHint({ locale, text }: { locale: AppLocale; text: string }) {
   );
 }
 
+function QuotaSkeleton() {
+  return (
+    <div className="grid gap-3" aria-busy="true" aria-label="Loading quota">
+      {[0, 1].map((index) => (
+        <div
+          key={index}
+          className="rounded-lg border border-border/70 bg-background/30 p-3"
+        >
+          <div className="flex items-center justify-between gap-3">
+            <span className="h-3 w-28 animate-pulse rounded bg-muted" />
+            <span className="h-3 w-14 animate-pulse rounded bg-muted" />
+          </div>
+          <span className="mt-3 block h-1.5 w-full animate-pulse rounded-full bg-muted" />
+          <span className="mt-3 block h-3 w-40 animate-pulse rounded bg-muted" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export function AccountsPanel({
   locale,
   onAdd,
@@ -266,7 +325,12 @@ export function AccountsPanel({
 }) {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [loading, setLoading] = useState(false);
-  const [checking, setChecking] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [checkingAll, setCheckingAll] = useState(false);
+  const [checkingAccounts, setCheckingAccounts] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const [actionPending, setActionPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [recommendation, setRecommendation] = useState<Recommendation | null>(
     null,
@@ -280,22 +344,29 @@ export function AccountsPanel({
   const [openingProfile, setOpeningProfile] = useState<string | null>(null);
   const [expandedAccount, setExpandedAccount] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
+  const hasLoadedRef = useRef(false);
+  const refreshInFlightRef = useRef<Promise<void> | null>(null);
 
-  const refresh = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const response = await fetch("/api/codex-manager/accounts", {
-        cache: "no-store",
-        headers: { Accept: "application/json" },
-      });
-      if (!response.ok) throw new Error(await response.text());
-      const payload = (await response.json()) as {
-        accounts?: Account[];
-        sync?: AccountSync;
-      };
-      setAccounts(payload.accounts ?? []);
-      if (payload.sync?.error) {
+  const refresh = useCallback(() => {
+    if (refreshInFlightRef.current) return refreshInFlightRef.current;
+    const initialLoad = !hasLoadedRef.current;
+    if (initialLoad) setLoading(true);
+    setRefreshing(true);
+    const task = (async () => {
+      setError(null);
+      try {
+        const response = await fetch("/api/codex-manager/accounts", {
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+        });
+        if (!response.ok) throw new Error(await response.text());
+        const payload = (await response.json()) as {
+          accounts?: Account[];
+          sync?: AccountSync;
+        };
+        setAccounts(payload.accounts ?? []);
+        hasLoadedRef.current = true;
+        if (payload.sync?.error) {
         const names = payload.sync.conflictingNames ?? [];
         setError(
           names.length > 0
@@ -306,42 +377,56 @@ export function AccountsPanel({
               )
             : payload.sync.error,
         );
-      }
-      const [recommendationResponse, profilesResponse] = await Promise.all([
-        fetch("/api/codex-manager/recommendation", { cache: "no-store" }),
-        fetch("/api/codex-manager/browser/profiles", { cache: "no-store" }),
-      ]);
-      if (recommendationResponse.ok) {
-        const recommendationPayload =
-          (await recommendationResponse.json()) as RecommendationResponse;
-        setRecommendation(
-          recommendationPayload.best ?? recommendationPayload.Best ?? null,
-        );
-        setRecommendationResults(
-          recommendationPayload.results ?? recommendationPayload.Results ?? {},
-        );
-      }
-      if (profilesResponse.ok) {
-        const profilePayload = (await profilesResponse.json()) as {
-          profiles?: BrowserProfile[];
-        };
-        const nextProfiles: Record<string, BrowserProfile> = {};
-        for (const profile of profilePayload.profiles ?? []) {
-          if (profile.managedAccount) nextProfiles[profile.managedAccount] ??= profile;
-          for (const accountName of Object.values(profile.accounts ?? {}))
-            nextProfiles[accountName] ??= profile;
         }
-        setProfileForAccount(nextProfiles);
+        const [recommendationResponse, profilesResponse] = await Promise.all([
+          fetch("/api/codex-manager/recommendation", { cache: "no-store" }),
+          fetch("/api/codex-manager/browser/profiles", { cache: "no-store" }),
+        ]);
+        if (recommendationResponse.ok) {
+          const recommendationPayload =
+            (await recommendationResponse.json()) as RecommendationResponse;
+          setRecommendation(
+            recommendationPayload.best ?? recommendationPayload.Best ?? null,
+          );
+          setRecommendationResults(
+            recommendationPayload.results ?? recommendationPayload.Results ?? {},
+          );
+        }
+        if (profilesResponse.ok) {
+          const profilePayload = (await profilesResponse.json()) as {
+            profiles?: BrowserProfile[];
+          };
+          const nextProfiles: Record<string, BrowserProfile> = {};
+          for (const profile of profilePayload.profiles ?? []) {
+            if (profile.managedAccount)
+              nextProfiles[profile.managedAccount] ??= profile;
+            for (const accountName of Object.values(profile.accounts ?? {}))
+              nextProfiles[accountName] ??= profile;
+          }
+          setProfileForAccount(nextProfiles);
+        }
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : String(cause));
+      } finally {
+        setRefreshing(false);
+        if (initialLoad) setLoading(false);
       }
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-    } finally {
-      setLoading(false);
-    }
+    })();
+    refreshInFlightRef.current = task;
+    void task.finally(() => {
+      if (refreshInFlightRef.current === task) {
+        refreshInFlightRef.current = null;
+      }
+    });
+    return task;
   }, [locale]);
   useEffect(() => {
     void refresh();
   }, [refresh, refreshKey]);
+  useEffect(() => {
+    const timer = window.setInterval(() => void refresh(), CODEX_MANAGER_AUTO_REFRESH_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [refresh]);
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 60_000);
     return () => window.clearInterval(timer);
@@ -355,7 +440,7 @@ export function AccountsPanel({
     if (!response.ok) throw new Error(await response.text());
   }
   async function activate(name: string) {
-    setLoading(true);
+    setActionPending(true);
     setError(null);
     try {
       await request(
@@ -365,11 +450,12 @@ export function AccountsPanel({
       await refresh();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
-      setLoading(false);
+    } finally {
+      setActionPending(false);
     }
   }
   async function activateBest() {
-    setChecking(true);
+    setActionPending(true);
     setError(null);
     try {
       await request("/api/codex-manager/recommendation", { method: "POST" });
@@ -377,11 +463,11 @@ export function AccountsPanel({
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
-      setChecking(false);
+      setActionPending(false);
     }
   }
   async function refreshAccount(account: Account, forceRefresh = false) {
-    setChecking(true);
+    setCheckingAccounts((current) => new Set(current).add(account.name));
     setError(null);
     try {
       await request(
@@ -396,11 +482,15 @@ export function AccountsPanel({
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
-      setChecking(false);
+      setCheckingAccounts((current) => {
+        const next = new Set(current);
+        next.delete(account.name);
+        return next;
+      });
     }
   }
   async function setSessionMonitor(account: Account, disabled: boolean) {
-    setChecking(true);
+    setActionPending(true);
     setError(null);
     try {
       await request(
@@ -415,7 +505,7 @@ export function AccountsPanel({
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
-      setChecking(false);
+      setActionPending(false);
     }
   }
   async function rename(account: Account) {
@@ -423,7 +513,7 @@ export function AccountsPanel({
       .prompt(tr(locale, "نام جدید حساب:", "New account name:"), account.name)
       ?.trim();
     if (!next || next === account.name) return;
-    setLoading(true);
+    setActionPending(true);
     setError(null);
     try {
       await request(
@@ -437,7 +527,8 @@ export function AccountsPanel({
       await refresh();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
-      setLoading(false);
+    } finally {
+      setActionPending(false);
     }
   }
   async function remove(account: Account) {
@@ -451,7 +542,7 @@ export function AccountsPanel({
       )
     )
       return;
-    setLoading(true);
+    setActionPending(true);
     setError(null);
     try {
       await request(
@@ -461,11 +552,12 @@ export function AccountsPanel({
       await refresh();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
-      setLoading(false);
+    } finally {
+      setActionPending(false);
     }
   }
   async function checkNow() {
-    setChecking(true);
+    setCheckingAll(true);
     setError(null);
     try {
       await request("/api/codex-manager/check", { method: "POST" });
@@ -473,7 +565,7 @@ export function AccountsPanel({
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
-      setChecking(false);
+      setCheckingAll(false);
     }
   }
   async function openProfile(profile: BrowserProfile) {
@@ -490,7 +582,7 @@ export function AccountsPanel({
       setOpeningProfile(null);
     }
   }
-  const busy = loading || checking;
+  const busy = loading || actionPending;
   const orderedAccounts = [...accounts].sort((left, right) => {
     // Match codex-manager's TUI ordering: paid/unknown plans first, then the
     // recommendation score, then a stable name ordering. A missing sample
@@ -545,7 +637,7 @@ export function AccountsPanel({
               "Refresh account list",
             )}
           >
-            {loading ? (
+            {refreshing ? (
               <Loader2 className="size-3.5 animate-spin" />
             ) : (
               <RefreshCw className="size-3.5" />
@@ -555,9 +647,9 @@ export function AccountsPanel({
             size="sm"
             variant="ghost"
             onClick={() => void checkNow()}
-            disabled={busy}
+            disabled={busy || checkingAll}
           >
-            {checking ? (
+            {checkingAll ? (
               <Loader2 className="size-3.5 animate-spin" />
             ) : (
               <Check className="size-3.5" />
@@ -566,14 +658,14 @@ export function AccountsPanel({
           </Button>
         </div>
       </div>
-      {busy ? (
+      {loading || checkingAll ? (
         <p
           className="flex items-center gap-1.5 text-xs text-muted-foreground"
           role="status"
           aria-live="polite"
         >
           <Loader2 className="size-3 animate-spin" />
-          {checking
+          {checkingAll
             ? tr(
                 locale,
                 "در حال بررسی/refresh حساب‌ها…",
@@ -629,7 +721,7 @@ export function AccountsPanel({
           </Button>
         </div>
       ) : null}
-      {accounts.length === 0 && !busy ? (
+      {accounts.length === 0 && !loading ? (
         <div className="rounded-lg border border-dashed border-border px-4 py-8 text-center text-xs text-muted-foreground">
           <UserPlus className="mx-auto mb-2 size-5" />
           {tr(
@@ -676,14 +768,17 @@ export function AccountsPanel({
           </div>
           <div role="rowgroup">
             {orderedAccounts.map((account) => {
-              const limits = account.rateLimits?.limits ?? [];
               const weekly = quotaWindowFor(account, "weekly");
               const fiveHour = quotaWindowFor(account, "fiveHour");
+              const hideFiveHour = weeklyQuotaExhausted(weekly);
+              const visibleLimits = visibleQuotaLimits(account);
+              const quotaChecking = checkingAll || checkingAccounts.has(account.name);
               const scannedProfile = profileForAccount[account.name];
               const profile = account.chromeProfile ?? scannedProfile;
               const profileState = chromeProfileState(profile, locale);
               const expanded = expandedAccount === account.name;
               const needsRelogin = accountNeedsRelogin(account, now);
+			  const displayStatusMessage = account.state === "ready" ? "" : account.statusMessage;
               const detailsID = `codex-account-${account.name}-details`;
               const accountStateClass =
                 account.state === "ready"
@@ -716,7 +811,7 @@ export function AccountsPanel({
                         <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
                           {planLabel(account.plan, locale)}
                         </span>
-                        <span className={`rounded-full px-1.5 py-0.5 text-[10px] ${needsRelogin ? "bg-destructive/15 font-semibold text-destructive" : accountStateClass}`} title={account.statusMessage || undefined}>
+						<span className={`rounded-full px-1.5 py-0.5 text-[10px] ${needsRelogin ? "bg-destructive/15 font-semibold text-destructive" : accountStateClass}`} title={displayStatusMessage || undefined}>
                           {needsRelogin ? tr(locale, "ورود دوباره لازم است", "Re-login required") : stateLabel(account.state, locale)}
                         </span>
                       </span>
@@ -727,10 +822,10 @@ export function AccountsPanel({
                       </span>
                     </span>
                     <span className={`hidden whitespace-nowrap text-sm font-semibold tabular-nums lg:block ${quotaTone(weekly)}`} role="cell">
-                      {quotaListLabel(weekly, locale, now)}
+                      {quotaChecking ? <span className="inline-block h-4 w-12 animate-pulse rounded bg-muted" aria-label={tr(locale, "در حال بررسی سهمیه", "Checking quota")} /> : quotaListLabel(weekly, locale, now)}
                     </span>
-                    <span className={`hidden whitespace-nowrap text-sm font-semibold tabular-nums lg:block ${quotaTone(fiveHour)}`} role="cell">
-                      {quotaListLabel(fiveHour, locale, now)}
+                    <span className={`hidden whitespace-nowrap text-sm font-semibold tabular-nums lg:block ${hideFiveHour ? "text-muted-foreground" : quotaTone(fiveHour)}`} role="cell">
+                      {quotaChecking ? <span className="inline-block h-4 w-12 animate-pulse rounded bg-muted" aria-label={tr(locale, "در حال بررسی سهمیه", "Checking quota")} /> : hideFiveHour ? "—" : quotaListLabel(fiveHour, locale, now)}
                     </span>
                     <span className={`hidden min-w-0 items-center gap-1 text-xs lg:flex ${profileState.className}`} role="cell" title={profile ? `${profile.name} · ${profileState.label}` : undefined}>
                       {profile ? <CircleAlert className="size-3 shrink-0" aria-hidden="true" /> : null}
@@ -750,8 +845,8 @@ export function AccountsPanel({
                             <InfoHint locale={locale} text={tr(locale, "اطلاعات کامل، زمان بازنشانی و عملیات همین حساب در این بخش قرار دارد.", "This section contains the account details, reset times, and actions.")} />
                           </div>
                           <div className="flex flex-wrap items-center gap-1">
-                            <Button size="sm" variant="outline" onClick={() => void refreshAccount(account)} disabled={busy}>
-                              <RefreshCw className="size-3.5" />
+                            <Button size="sm" variant="outline" onClick={() => void refreshAccount(account)} disabled={busy || quotaChecking}>
+                              {quotaChecking ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
                               {tr(locale, "بررسی سهمیه", "Check limits")}
                             </Button>
                             {!account.active ? (
@@ -786,9 +881,15 @@ export function AccountsPanel({
                               <span className="text-muted-foreground">{tr(locale, "پروفایل Chrome در آخرین مشاهده: ", "Chrome profile at last observation: ")}</span>
                               {profile.name}
                               <span className={`ms-1.5 ${profileState.className}`}>· {profileState.label}</span>
-                              {profile.activeEmail && profile.outcome !== "signed_in" ? <span className="ms-1 text-muted-foreground" dir="ltr">({profile.activeEmail})</span> : null}
+                              {profile.activeEmail ? <span className="ms-1 text-muted-foreground" dir="ltr">({profile.activeEmail})</span> : null}
                             </span>
-                            <Button size="sm" variant="outline" onClick={() => void openProfile(profile)} disabled={busy || openingProfile === profile.id}>
+                            <span className="w-full text-muted-foreground">
+                              {profile.activeEmail
+                                ? `${tr(locale, "ورود فعلی ChatGPT: ", "Current ChatGPT sign-in: ")}${profile.activeEmail}`
+                                : tr(locale, "در حال حاضر ورود ChatGPT تأیید نشده است.", "No current ChatGPT sign-in is confirmed.")}
+                              {profile.lastActiveEmail ? <span className="ms-2" dir="ltr">· {tr(locale, "آخرین حساب این Chrome: ", "Last account in this Chrome: ")}{profile.lastActiveEmail}{profile.lastManagedAccount ? ` (${profile.lastManagedAccount})` : ""}</span> : null}
+                            </span>
+                            <Button size="sm" variant="outline" onClick={() => void openProfile(profile)} disabled={busy || openingProfile === profile.id || profile.outcome === "missing"}>
                               {openingProfile === profile.id ? <Loader2 className="size-3.5 animate-spin" /> : <ExternalLink className="size-3.5" />}
                               {tr(locale, "باز کردن Chrome", "Open Chrome")}
                             </Button>
@@ -843,7 +944,8 @@ export function AccountsPanel({
                           <h4 className="text-sm font-semibold">{tr(locale, "سهمیه و زمان بازنشانی", "Quota and reset times")}</h4>
                           <InfoHint locale={locale} text={tr(locale, "درصدها مقدار باقی‌مانده‌اند؛ زمان زیر هر نوار، زمان تقریبی آزاد شدن دوبارهٔ سهمیه است.", "Percentages show what remains. The time below a bar estimates when that allowance becomes available again.")} />
                         </div>
-                        {limits.length > 0 ? limits.flatMap((limit) => limit.windows.map((window) => {
+                        {quotaChecking ? <QuotaSkeleton /> : visibleLimits.length > 0 ? visibleLimits.flatMap((limit) => limit.windows
+                          .map((window) => {
                           const value = quotaPercent(window) ?? 0;
                           return <div key={`${limit.id}-${window.label}`} className="rounded-lg border border-border/70 bg-background/30 p-3">
                             <div className="flex items-center justify-between gap-3 text-xs"><span dir="ltr">{limit.name || limit.id} · {window.label}</span><span className={`font-semibold tabular-nums ${quotaTone(window)}`}>{Math.round(value)}% {tr(locale, "باقی", "remaining")}</span></div>
@@ -853,7 +955,7 @@ export function AccountsPanel({
                         })) : <p className="rounded-lg border border-dashed border-border px-3 py-4 text-xs text-muted-foreground">{tr(locale, "هنوز سهمیه‌ای برای این حساب ثبت نشده است. «بررسی سهمیه» را بزنید تا مقدارها نمایش داده شوند.", "No quota has been recorded for this account yet. Select “Check limits” to load it.")}</p>}
                         {account.rateLimits?.reachedType ? <p className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">{tr(locale, "یکی از سهمیه‌های این حساب فعلاً تمام شده است.", "One of this account’s allowances is currently exhausted.")}</p> : null}
                         {account.rateLimits?.error ? <p className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">{tr(locale, "بررسی سهمیهٔ این حساب ناموفق بود: ", "This account’s quota check failed: ")}{account.rateLimits.error}</p> : null}
-                        {account.statusMessage ? <p className="rounded-lg border border-border/70 bg-background/30 px-3 py-2 text-xs text-muted-foreground">{account.statusMessage}</p> : null}
+						{displayStatusMessage ? <p className="rounded-lg border border-border/70 bg-background/30 px-3 py-2 text-xs text-muted-foreground">{displayStatusMessage}</p> : null}
                         <Button size="sm" variant="ghost" className="justify-self-start" onClick={() => onRelogin(account.name)} disabled={busy}>{tr(locale, "نوسازی اجباری ورود", "Force sign-in refresh")}</Button>
                       </div>
                     </div>

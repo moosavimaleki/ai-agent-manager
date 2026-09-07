@@ -1,11 +1,8 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { Navigate, Outlet, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom"
-import { AbolqasemLogo } from "../components/AbolqasemLogo"
 import { AbolqasemSplashLogo } from "../components/AbolqasemSplashLogo"
 import { AppDialogProvider } from "../components/ui/app-dialog"
 import { Button } from "../components/ui/button"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card"
-import { Input } from "../components/ui/input"
 import { TooltipProvider } from "../components/ui/tooltip"
 import { Bell, Loader2, Settings2, X } from "lucide-react"
 import { getAppearanceThemeClassName, useDocumentAppearanceTheme, useReaderAppearanceSettings } from "../components/appearance/ReaderAppearance"
@@ -15,30 +12,31 @@ import type { ChatSoundPreference } from "../stores/chatSoundPreferencesStore"
 import { playChatNotificationSound, shouldPlayChatSound } from "../lib/chatSounds"
 import { getChatSoundBurstCount, getNotificationTitleCount } from "./chatNotifications"
 import { cn } from "../lib/utils"
-import { AbolqasemSidebar } from "./AbolqasemSidebar"
-import { ChatPage } from "./ChatPage"
 import { READER_MODE_CHANGE_EVENT } from "./chatFocusPolicy"
-import { LocalProjectsPage } from "./LocalProjectsPage"
-import { SettingsPage } from "./SettingsPage"
-import { FileRoutePage } from "./FileRoutePage"
 import { useAbolqasemState, type SessionForkOperation } from "./useAbolqasemState"
 import { chatRoute, hookNotificationSettingsRoute, settingsRoute } from "./routes"
 import type { AppSettingsSnapshot } from "../../shared/types"
 import { getDictionary, getLocaleDirection, LOCALE_STORAGE_KEY, normalizeLocale } from "../i18n"
 import { I18nProvider } from "../i18n/context"
 
+// These screens are not needed to open or resume a chat. Keeping them out of
+// the entry chunk prevents settings/editor dependencies from blocking the
+// initial chat hydration on slower CPUs.
+const SettingsPage = lazy(() => import("./SettingsPage").then((module) => ({ default: module.SettingsPage })))
+const FileRoutePage = lazy(() => import("./FileRoutePage").then((module) => ({ default: module.FileRoutePage })))
+const AbolqasemSidebar = lazy(() => import("./AbolqasemSidebar").then((module) => ({ default: module.AbolqasemSidebar })))
+const LocalProjectsPage = lazy(() => import("./LocalProjectsPage").then((module) => ({ default: module.LocalProjectsPage })))
+// The chat transcript includes markdown/highlighting and message renderers.
+// Load it only after the authenticated application shell has mounted so the
+// sidebar and its initial state requests are never blocked on that work.
+const ChatPage = lazy(() => import("./ChatPage").then((module) => ({ default: module.ChatPage })))
+
 const VERSION_SEEN_STORAGE_KEY = "abolqasem:last-seen-version"
-const AUTH_STATUS_RETRY_DELAY_MS = 500
 const SPLASH_MIN_VISIBLE_MS = 420
 // Keep a very short floor to avoid a single-frame flash, but never hold the UI
 // after the sidebar and active chat are ready.
 const STARTUP_SPLASH_MIN_VISIBLE_MS = 160
 const HOOK_TOAST_TIMEOUT_MS = 8000
-
-interface AuthStatusResponse {
-  enabled: boolean
-  authenticated: boolean
-}
 
 type AppAuthState = { status: "checking" } | { status: "ready" } | { status: "locked"; error: string | null }
 
@@ -294,7 +292,7 @@ function useMinimumVisibility(visible: boolean, minimumVisibleMs = SPLASH_MIN_VI
   return isVisible
 }
 
-export function getAppAuthStateFromStatus(payload: Partial<AuthStatusResponse>): AppAuthState {
+export function getAppAuthStateFromStatus(payload: { enabled?: boolean; authenticated?: boolean }): AppAuthState {
   if (!payload.enabled || payload.authenticated) {
     return { status: "ready" }
   }
@@ -308,139 +306,6 @@ export function shouldRetryAuthStatusRequest(responseOk: boolean | null) {
 
 export function shouldShowStartupSplash(initialBootComplete: boolean, sidebarReady: boolean, chatReady: boolean) {
   return !initialBootComplete && (!sidebarReady || !chatReady)
-}
-
-function PasswordScreen({ error, onSubmit }: { error: string | null; onSubmit: (password: string) => Promise<void> }) {
-  const [password, setPassword] = useState("")
-  const [submitting, setSubmitting] = useState(false)
-  const dictionary = getDictionary(normalizeLocale(document.documentElement.lang))
-
-  async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    if (!password || submitting) return
-    setSubmitting(true)
-    try {
-      await onSubmit(password)
-      setPassword("")
-    } finally {
-      setSubmitting(false)
-    }
-  }
-
-  return (
-    <div className="flex min-h-[100dvh] items-center justify-center bg-background px-6 py-10">
-      <Card className="w-full max-w-md rounded-3xl border border-border bg-card shadow-sm">
-        <CardHeader className="flex flex-col p-2 space-y-3 px-6 pt-6 pb-5 pl-[28px]">
-          <div className="flex items-center gap-3">
-            <AbolqasemLogo className="h-5 w-5 text-logo" />
-            <div>
-              <CardTitle className="font-logo text-xl uppercase text-slate-600 dark:text-slate-100">{APP_NAME}</CardTitle>
-            </div>
-          </div>
-          <CardDescription className="leading-6">{dictionary.app.passwordDescription}</CardDescription>
-        </CardHeader>
-        <CardContent className="px-6 pb-6">
-          <form className="space-y-4" onSubmit={(event) => void handleSubmit(event)}>
-            {error ? <div className="rounded-2xl border border-destructive/20 bg-destructive/10 px-4 py-3 text-sm text-foreground">{error}</div> : null}
-            <Input
-              id="abolqasem-password"
-              type="password"
-              autoComplete="current-password"
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-              placeholder={dictionary.app.passwordPlaceholder}
-              disabled={submitting}
-              className="h-11 rounded-2xl bg-background"
-            />
-            <Button type="submit" disabled={submitting || password.length === 0} className="h-11 w-full">
-              {submitting ? dictionary.app.unlocking : dictionary.app.unlock}
-            </Button>
-          </form>
-        </CardContent>
-      </Card>
-    </div>
-  )
-}
-
-function useAppAuthState() {
-  const [state, setState] = useState<AppAuthState>({ status: "checking" })
-  const retryTimeoutRef = useRef<number | null>(null)
-
-  const refresh = useCallback(async () => {
-    if (retryTimeoutRef.current !== null) {
-      window.clearTimeout(retryTimeoutRef.current)
-      retryTimeoutRef.current = null
-    }
-
-    setState((current) => (current.status === "ready" ? current : { status: "checking" }))
-
-    let response: Response
-    try {
-      response = await fetch("/auth/status", {
-        method: "GET",
-        cache: "no-store",
-        headers: {
-          Accept: "application/json",
-        },
-      })
-    } catch {
-      retryTimeoutRef.current = window.setTimeout(() => {
-        void refresh()
-      }, AUTH_STATUS_RETRY_DELAY_MS)
-      return
-    }
-
-    if (shouldRetryAuthStatusRequest(response.ok)) {
-      retryTimeoutRef.current = window.setTimeout(() => {
-        void refresh()
-      }, AUTH_STATUS_RETRY_DELAY_MS)
-      return
-    }
-
-    const payload = (await response.json()) as Partial<AuthStatusResponse>
-    setState(getAppAuthStateFromStatus(payload))
-  }, [])
-
-  useEffect(() => {
-    void refresh()
-    return () => {
-      if (retryTimeoutRef.current !== null) {
-        window.clearTimeout(retryTimeoutRef.current)
-      }
-    }
-  }, [refresh])
-
-  const submitPassword = useCallback(
-    async (password: string) => {
-      const response = await fetch("/auth/login", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-        },
-        body: JSON.stringify({
-          password,
-          next: window.location.pathname + window.location.search,
-        }),
-      })
-
-      if (!response.ok) {
-        setState({
-          status: "locked",
-          error: getDictionary(normalizeLocale(document.documentElement.lang)).app.incorrectPassword,
-        })
-        return
-      }
-
-      await refresh()
-    },
-    [refresh]
-  )
-
-  return {
-    state,
-    submitPassword,
-  }
 }
 
 export function shouldRedirectToChangelog(pathname: string, currentVersion: string, seenVersion: string | null) {
@@ -580,40 +445,43 @@ function AbolqasemLayout() {
   }, [navigate])
   const sidebarElement = useMemo(
     () => (
-      <AbolqasemSidebar
-        data={state.sidebarData}
-        activeChatId={state.activeChatId}
-        connectionStatus={state.connectionStatus}
-        ready={state.sidebarReady}
-        pendingArchiveChatIds={state.pendingArchiveChatIds}
-        open={state.sidebarOpen}
-        collapsed={state.sidebarCollapsed}
-        showMobileOpenButton={showMobileOpenButton}
-        onOpen={state.openSidebar}
-        onClose={state.closeSidebar}
-        onCollapse={state.collapseSidebar}
-        onExpand={state.expandSidebar}
-        onCreateChat={handleSidebarCreateChat}
-        onForkChat={handleSidebarForkChat}
-        onConvertChat={handleSidebarConvertChat}
-        currentProjectId={state.activeProjectId}
-        creatingChatProjectId={state.creatingChatProjectId}
-        keybindings={state.keybindings}
-        onRenameChat={handleSidebarRenameChat}
-        onArchiveChat={handleSidebarArchiveChat}
-        onPinChat={state.handlePinChat}
-        onOpenArchivedChat={handleOpenArchivedChat}
-        onDeleteChat={handleSidebarDeleteChat}
-        onOpenAddProjectModal={handleOpenAddProjectModal}
-        onCopyPath={handleSidebarCopyPath}
-        onOpenExternalPath={handleSidebarOpenExternalPath}
-        onRenameProject={handleSidebarRenameProject}
-        onHideProject={handleSidebarHideProject}
-        onReorderProjectGroups={handleSidebarReorderProjectGroups}
-        editorLabel={state.editorLabel}
-        updateSnapshot={state.updateSnapshot}
-        onOpenChangelog={handleOpenChangelog}
-      />
+      <Suspense fallback={<SidebarLoading />}>
+        <AbolqasemSidebar
+          data={state.sidebarData}
+          activeChatId={state.activeChatId}
+          connectionStatus={state.connectionStatus}
+          ready={state.sidebarReady}
+          pendingArchiveChatIds={state.pendingArchiveChatIds}
+          open={state.sidebarOpen}
+          collapsed={state.sidebarCollapsed}
+          showMobileOpenButton={showMobileOpenButton}
+          onOpen={state.openSidebar}
+          onClose={state.closeSidebar}
+          onCollapse={state.collapseSidebar}
+          onExpand={state.expandSidebar}
+          onCreateChat={handleSidebarCreateChat}
+          onForkChat={handleSidebarForkChat}
+          onConvertChat={handleSidebarConvertChat}
+          currentProjectId={state.activeProjectId}
+          creatingChatProjectId={state.creatingChatProjectId}
+          keybindings={state.keybindings}
+          onRenameChat={handleSidebarRenameChat}
+          onArchiveChat={handleSidebarArchiveChat}
+          onPinChat={state.handlePinChat}
+          onReorderPinnedChats={state.handleReorderPinnedChats}
+          onOpenArchivedChat={handleOpenArchivedChat}
+          onDeleteChat={handleSidebarDeleteChat}
+          onOpenAddProjectModal={handleOpenAddProjectModal}
+          onCopyPath={handleSidebarCopyPath}
+          onOpenExternalPath={handleSidebarOpenExternalPath}
+          onRenameProject={handleSidebarRenameProject}
+          onHideProject={handleSidebarHideProject}
+          onReorderProjectGroups={handleSidebarReorderProjectGroups}
+          editorLabel={state.editorLabel}
+          updateSnapshot={state.updateSnapshot}
+          onOpenChangelog={handleOpenChangelog}
+        />
+      </Suspense>
     ),
     [
       handleOpenChangelog,
@@ -815,44 +683,48 @@ function AbolqasemLayout() {
 }
 
 export function App() {
-  const auth = useAppAuthState()
   const [appearanceSettings] = useReaderAppearanceSettings()
   useDocumentAppearanceTheme(appearanceSettings)
-  const locale = normalizeLocale(document.documentElement.lang)
-  const dictionary = getDictionary(locale)
-
-  if (auth.state.status === "checking") {
-    return (
-      <SplashScreen
-        locale={locale}
-        appearanceClassName={getAppearanceThemeClassName(appearanceSettings)}
-        title={APP_NAME}
-        subtitle={dictionary.app.checkingSession}
-      />
-    )
-  }
-
-  if (auth.state.status === "locked") {
-    return <PasswordScreen error={auth.state.error} onSubmit={auth.submitPassword} />
-  }
 
   return (
     <TooltipProvider>
       <AppDialogProvider>
         <Routes>
           <Route element={<AbolqasemLayout />}>
-            <Route path="/" element={<LocalProjectsPage />} />
+            <Route path="/" element={<Suspense fallback={<RouteLoading />}><LocalProjectsPage /></Suspense>} />
             <Route path="/settings" element={<Navigate to={settingsRoute("general")} replace />} />
             <Route path="/settings/:sectionId" element={<LegacySettingsRedirect />} />
             <Route path="/chat/:chatId" element={<LegacyChatRedirect />} />
             <Route path="/_/settings" element={<Navigate to={settingsRoute("general")} replace />} />
-            <Route path="/_/settings/:sectionId" element={<SettingsPage />} />
-            <Route path="/_/chat/:chatId" element={<ChatPage />} />
+            <Route path="/_/settings/:sectionId" element={<Suspense fallback={<RouteLoading />}><SettingsPage /></Suspense>} />
+            <Route path="/_/chat/:chatId" element={<Suspense fallback={<RouteLoading />}><ChatPage /></Suspense>} />
           </Route>
-          <Route path="*" element={<FileRoutePage />} />
+          <Route path="*" element={<Suspense fallback={<RouteLoading />}><FileRoutePage /></Suspense>} />
         </Routes>
       </AppDialogProvider>
     </TooltipProvider>
+  )
+}
+
+function RouteLoading() {
+  return (
+    <main className="flex min-w-0 flex-1 items-center justify-center bg-background text-muted-foreground" aria-busy="true">
+      <Loader2 className="size-5 animate-spin" />
+    </main>
+  )
+}
+
+function SidebarLoading() {
+  return (
+    <aside className="hidden h-full w-[275px] shrink-0 flex-col gap-3 border-e border-border bg-card p-3 md:flex" aria-busy="true">
+      <div className="h-8 w-28 animate-pulse rounded-md bg-muted" />
+      <div className="h-9 animate-pulse rounded-md bg-muted" />
+      <div className="space-y-2 pt-2">
+        <div className="h-8 animate-pulse rounded-md bg-muted" />
+        <div className="h-8 animate-pulse rounded-md bg-muted" />
+        <div className="h-8 animate-pulse rounded-md bg-muted" />
+      </div>
+    </aside>
   )
 }
 

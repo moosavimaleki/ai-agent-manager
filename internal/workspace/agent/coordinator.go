@@ -126,6 +126,7 @@ type PendingToolSnapshot struct {
 }
 
 type SendCommand struct {
+	RequestID    string
 	ChatID       string
 	ProjectID    string
 	Content      string
@@ -138,6 +139,7 @@ type SendCommand struct {
 }
 
 type QueueMessageInput struct {
+	RequestID    string
 	Content      string
 	Attachments  []readmodels.ChatAttachment
 	Provider     string
@@ -334,6 +336,7 @@ func (c *Coordinator) Send(ctx context.Context, command SendCommand) (SendResult
 
 	if c.isActive(chatID) {
 		queued, err := c.store.EnqueueMessage(chatID, QueueMessageInput{
+			RequestID:    command.RequestID,
 			Content:      command.Content,
 			Attachments:  command.Attachments,
 			Provider:     command.Provider,
@@ -356,6 +359,7 @@ func (c *Coordinator) Send(ctx context.Context, command SendCommand) (SendResult
 
 func (c *Coordinator) Enqueue(command SendCommand) (string, error) {
 	queued, err := c.store.EnqueueMessage(command.ChatID, QueueMessageInput{
+		RequestID:    command.RequestID,
 		Content:      command.Content,
 		Attachments:  command.Attachments,
 		Provider:     command.Provider,

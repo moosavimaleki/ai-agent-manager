@@ -3,6 +3,8 @@ package rpc
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -82,6 +84,48 @@ func TestRecordsStderr(t *testing.T) {
 	client.RecordStderr("fatal: app-server crashed")
 	if got := client.Stderr(); got != "fatal: app-server crashed\n" {
 		t.Fatalf("unexpected stderr log: %q", got)
+	}
+}
+
+func TestCloseFailsPendingAndFutureCalls(t *testing.T) {
+	transport := &fakeTransport{}
+	client := NewClient(transport)
+	pending := make(chan error, 1)
+	go func() {
+		pending <- client.Call(context.Background(), "turn/start", nil, nil)
+	}()
+	transport.waitForMessages(t, 1)
+
+	client.Close(errors.New("app-server exited unexpectedly"))
+
+	select {
+	case err := <-pending:
+		if err == nil || !strings.Contains(err.Error(), "app-server exited unexpectedly") {
+			t.Fatalf("unexpected pending call error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pending call stayed blocked after client close")
+	}
+	if err := client.Call(context.Background(), "thread/resume", nil, nil); err == nil || !strings.Contains(err.Error(), "app-server exited unexpectedly") {
+		t.Fatalf("future call did not fail with close error: %v", err)
+	}
+}
+
+func TestCallDeadlineRemovesPendingRequest(t *testing.T) {
+	transport := &fakeTransport{}
+	client := NewClient(transport)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	err := client.Call(ctx, "initialize", nil, nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline error, got %v", err)
+	}
+	client.mu.Lock()
+	pendingCount := len(client.pending)
+	client.mu.Unlock()
+	if pendingCount != 0 {
+		t.Fatalf("timed-out request remained pending: %d", pendingCount)
 	}
 }
 

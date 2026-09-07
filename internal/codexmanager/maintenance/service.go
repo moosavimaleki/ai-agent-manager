@@ -2,17 +2,14 @@ package maintenance
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"time"
 
 	"abolqasem/internal/codexmanager/account"
 	"abolqasem/internal/codexmanager/auth"
 	"abolqasem/internal/codexmanager/history"
 	"abolqasem/internal/codexmanager/limits"
-	"abolqasem/internal/codexmanager/storage"
 )
 
 type Config struct {
@@ -90,8 +87,28 @@ func (s Service) Run(ctx context.Context) (Summary, error) {
 	return summary, nil
 }
 
-func (s Service) checkOne(ctx context.Context, name, active string, now time.Time) Result {
-	result := Result{Account: name, State: "ok"}
+func (s Service) checkOne(ctx context.Context, name, active string, now time.Time) (result Result) {
+	result = Result{Account: name, State: "ok"}
+	var snapshot *limits.Snapshot
+	defer func() {
+		// Persist failures too. Previously an auth failure returned before the
+		// status write, leaving an old "ready" sample visible and selectable.
+		// The request context may already be cancelled by a failed network
+		// check, but recording that failure is precisely the important part.
+		persistCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		// A successful quota fetch is the user-facing proof that the account is
+		// usable. Reasons such as "access token is still valid" are internal
+		// refresh diagnostics, not an account status, and used to leak into the
+		// dashboard as a misleading warning.
+		statusMessage := result.Message
+		if result.State == "ok" && !result.Refreshed {
+			statusMessage = ""
+		}
+		if err := s.Accounts.RecordCheckStatus(persistCtx, name, persistedState(result.State), statusMessage, now, snapshot); err != nil && result.State == "ok" {
+			result = failed(result, "error", fmt.Errorf("persist verification result: %w", err))
+		}
+	}()
 	credentials, err := s.Accounts.Read(name)
 	if err != nil {
 		return failed(result, "needs_login", err)
@@ -121,39 +138,31 @@ func (s Service) checkOne(ctx context.Context, name, active string, now time.Tim
 	} else {
 		result.Message = reason
 	}
-	snapshot, fetchErr := limitsClient.Fetch(ctx, name, credentials)
+	fetched, fetchErr := limitsClient.Fetch(ctx, name, credentials)
 	if fetchErr != nil {
 		return failed(result, errorState(fetchErr), fetchErr)
 	}
-	_, _ = s.History.Append(ctx, snapshot)
+	snapshot = &fetched
+	_, _ = s.History.Append(ctx, fetched)
 	if name == active {
 		// The live auth file is owned by app-server. Maintenance intentionally
 		// never overwrites it while a turn is running.
 		result.Message += "; active credentials unchanged"
 	}
-	_ = writeStatus(s.Accounts.Paths, name, result, snapshot)
 	return result
 }
 
-func writeStatus(paths storage.Paths, name string, result Result, snapshot limits.Snapshot) error {
-	statusPath, err := paths.Status(name)
-	if err != nil {
-		return err
+func persistedState(resultState string) account.State {
+	switch resultState {
+	case "ok":
+		return account.StateReady
+	case "needs_login":
+		return account.StateNeedsLogin
+	case "warning":
+		return account.StateStale
+	default:
+		return account.StateError
 	}
-	payload := map[string]any{
-		"state":       result.State,
-		"message":     result.Message,
-		"checked_at":  snapshot.FetchedAt,
-		"rate_limits": snapshot,
-	}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	if err := storage.EnsureDirs(paths); err != nil {
-		return err
-	}
-	return os.WriteFile(statusPath, append(data, '\n'), 0600)
 }
 
 func failed(result Result, state string, err error) Result {

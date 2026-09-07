@@ -13,6 +13,7 @@ import (
 
 	"abolqasem/internal/codexmanager/auth"
 	"abolqasem/internal/codexmanager/history"
+	"abolqasem/internal/codexmanager/limits"
 	"abolqasem/internal/codexmanager/storage"
 )
 
@@ -88,6 +89,104 @@ func (r Repository) Read(name string) (map[string]any, error) {
 	var value map[string]any
 	err = storage.ReadJSON(path, &value)
 	return value, err
+}
+
+// Status returns the one safe, persisted status projection for an account.
+// A credential file merely proves that an account was imported; it does not
+// prove that Codex can authenticate with it. Therefore a missing, corrupt, or
+// unknown status is always reported as stale until a live quota check passes.
+func (r Repository) Status(name string) (Status, error) {
+	path, err := r.Paths.Status(name)
+	if err != nil {
+		return Status{State: StateStale, Message: "account has not been verified"}, err
+	}
+	var persisted struct {
+		State                  string           `json:"state"`
+		Message                string           `json:"message"`
+		CheckedAt              time.Time        `json:"checked_at"`
+		RateLimits             *limits.Snapshot `json:"rate_limits"`
+		SessionMonitor         *SessionMonitor  `json:"session_monitor"`
+		SessionMonitorDisabled bool             `json:"session_monitor_disabled"`
+		ChromeProfile          *ChromeProfile   `json:"chrome_profile"`
+	}
+	if err := storage.ReadJSON(path, &persisted); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return Status{State: StateStale, Message: "account has not been verified"}, nil
+		}
+		return Status{State: StateStale, Message: "account status is unreadable; verify it again"}, err
+	}
+	state := State(strings.TrimSpace(persisted.State))
+	if state != StateReady && state != StateNeedsLogin && state != StateError && state != StateStale {
+		state = StateStale
+	}
+	status := Status{
+		State:                  state,
+		Message:                strings.TrimSpace(persisted.Message),
+		RateLimits:             persisted.RateLimits,
+		SessionMonitor:         persisted.SessionMonitor,
+		SessionMonitorDisabled: persisted.SessionMonitorDisabled,
+		ChromeProfile:          persisted.ChromeProfile,
+	}
+	if !persisted.CheckedAt.IsZero() {
+		checkedAt := persisted.CheckedAt.UTC()
+		status.CheckedAt = &checkedAt
+	}
+	if status.Message == "" && state == StateStale {
+		status.Message = "account has not been verified"
+	}
+	return status, nil
+}
+
+// RecordCheckStatus atomically replaces only the live-verification fields.
+// Chrome/session-monitor metadata shares this file, so it is preserved rather
+// than being accidentally erased by quota maintenance.
+func (r Repository) RecordCheckStatus(ctx context.Context, name string, state State, message string, checkedAt time.Time, rateLimits *limits.Snapshot) error {
+	if state != StateReady && state != StateNeedsLogin && state != StateError && state != StateStale {
+		return fmt.Errorf("invalid account status %q", state)
+	}
+	path, err := r.Paths.Status(name)
+	if err != nil {
+		return err
+	}
+	return storage.WithLock(ctx, r.Paths, func() error {
+		payload := map[string]any{}
+		if err := storage.ReadJSON(path, &payload); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		payload["state"] = state
+		payload["message"] = strings.TrimSpace(message)
+		payload["checked_at"] = checkedAt.UTC()
+		payload["rate_limits"] = rateLimits
+		return storage.WriteJSON(r.Paths, path, payload)
+	})
+}
+
+// MarkVerificationPending marks a just-activated account as awaiting a live
+// verification without throwing away its last known quota sample. Switching
+// auth.json does not itself invalidate that account's quota, and preserving the
+// sample avoids a blank dashboard while the background check is in flight.
+func (r Repository) MarkVerificationPending(ctx context.Context, name string, now time.Time) error {
+	path, err := r.Paths.Status(name)
+	if err != nil {
+		return err
+	}
+	return storage.WithLock(ctx, r.Paths, func() error {
+		payload := map[string]any{}
+		if err := storage.ReadJSON(path, &payload); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		payload["state"] = StateStale
+		payload["message"] = "activation pending live verification"
+		payload["checked_at"] = now.UTC()
+		return storage.WriteJSON(r.Paths, path, payload)
+	})
+}
+
+// MarkVerificationPendingAfterCredentialChange clears the old quota sample.
+// A completed device login can replace credentials for the same account, so
+// the sample must not be shown as belonging to the new token.
+func (r Repository) MarkVerificationPendingAfterCredentialChange(ctx context.Context, name string, now time.Time) error {
+	return r.RecordCheckStatus(ctx, name, StateStale, "activation pending live verification", now, nil)
 }
 
 func (r Repository) List() ([]string, error) {

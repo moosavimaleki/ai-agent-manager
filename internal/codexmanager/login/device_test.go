@@ -99,11 +99,16 @@ func loginAuth(email string) map[string]any {
 
 func TestDeviceLoginImportsAndCallsCodeCallback(t *testing.T) {
 	client := &fakeClient{code: Code{LoginID: "login-1", VerificationURL: "https://example.invalid", UserCode: "ABCD"}, data: loginAuth("user@example.com")}
-	service := Service{Accounts: account.Repository{Paths: storage.Paths{Home: t.TempDir()}}, Client: client}
+	repository := account.Repository{Paths: storage.Paths{Home: t.TempDir()}}
+	service := Service{Accounts: repository, Client: client, Now: func() time.Time { return time.Date(2026, 9, 5, 10, 0, 0, 0, time.UTC) }}
 	called := false
 	result, err := service.Login(context.Background(), "user", false, "", Callbacks{OnCode: func(Code) { called = true }})
 	if err != nil || !called || result.Email != "user@example.com" {
 		t.Fatalf("result=%#v err=%v called=%v", result, err, called)
+	}
+	status, err := repository.Status("user")
+	if err != nil || status.State != account.StateStale || status.RateLimits != nil || status.Message != "activation pending live verification" {
+		t.Fatalf("new credentials must invalidate old quota status: status=%#v err=%v", status, err)
 	}
 }
 

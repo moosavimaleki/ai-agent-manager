@@ -20,7 +20,7 @@ export function DeviceLoginDialog({
   locale: AppLocale
   open: boolean
   onOpenChange: (open: boolean) => void
-  onCompleted: () => Promise<void>
+  onCompleted: (accountName: string) => Promise<void>
   initialAccountName?: string
   replaceExisting?: boolean
 }) {
@@ -69,7 +69,16 @@ export function DeviceLoginDialog({
           window.clearInterval(timer)
           if (result.status === "completed") {
             setStatus("completed")
-            await onCompleted()
+            // The authentication result is authoritative. A subsequent quota
+            // refresh can fail independently, so do not falsely report that
+            // the just-finished login failed or restart the device flow.
+            try {
+              await onCompleted(accountName.trim())
+            } catch (cause) {
+              if (!cancelled) {
+                setError(cause instanceof Error ? cause.message : String(cause))
+              }
+            }
             return
           }
           setStatus("failed")
@@ -110,6 +119,29 @@ export function DeviceLoginDialog({
     setCopied(true)
   }
 
+  async function openSignInPage() {
+    if (!code) return
+    setError(null)
+    // A re-login must continue in the Chrome profile historically associated
+    // with this account; opening a raw target=_blank link would silently use
+    // whichever browser profile happens to be the default.
+    if (replaceExisting && accountName.trim()) {
+      try {
+        const response = await fetch(`/api/codex-manager/accounts/${encodeURIComponent(accountName.trim())}/chrome-login`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify({ verificationUrl: code.verificationUrl }),
+        })
+        if (!response.ok) throw new Error(await response.text())
+        return
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : String(cause))
+        return
+      }
+    }
+    window.open(code.verificationUrl, "_blank", "noopener,noreferrer")
+  }
+
   async function close() {
     if (closing.current) return
     closing.current = true
@@ -129,7 +161,7 @@ export function DeviceLoginDialog({
       </DialogHeader>
       <DialogBody className="grid gap-3">
         {!code ? <label className="grid gap-1.5 text-sm font-medium"><span>{text(locale, "نام حساب", "Account name")}</span><input autoFocus value={accountName} disabled={status === "starting" || replaceExisting} readOnly={replaceExisting} className="h-9 rounded-md border border-input bg-transparent px-3 text-sm outline-none focus-visible:ring-1 focus-visible:ring-ring" onChange={(event) => setAccountName(event.target.value)} placeholder="personal" /></label> : <>
-          <a className="text-sm text-primary underline underline-offset-4" href={code.verificationUrl} target="_blank" rel="noreferrer">{text(locale, "باز کردن صفحهٔ ورود", "Open sign-in page")}</a>
+          <button type="button" className="w-fit text-sm text-primary underline underline-offset-4" onClick={() => void openSignInPage()}>{text(locale, "باز کردن صفحهٔ ورود", "Open sign-in page")}</button>
           <div className="flex items-center justify-between gap-2 rounded-lg border border-border bg-muted/35 p-3"><code dir="ltr" className="text-lg font-semibold tracking-[0.16em]">{code.userCode}</code><Button type="button" size="sm" variant="outline" onClick={() => void copyCode()}>{copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}{copied ? text(locale, "کپی شد", "Copied") : text(locale, "کپی", "Copy")}</Button></div>
           {status === "pending" ? <p className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="size-4 animate-spin" />{text(locale, "منتظر تأیید ورود…", "Waiting for sign-in confirmation…")} <span dir="ltr">{Math.floor(remaining / 60)}:{String(remaining % 60).padStart(2, "0")}</span></p> : null}
           {status === "completed" ? <p className="text-sm text-emerald-600 dark:text-emerald-400">{text(locale, "حساب افزوده شد.", "Account added.")}</p> : null}

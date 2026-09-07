@@ -194,6 +194,43 @@ func workspacePinChat(raw json.RawMessage) (string, error) {
 	return chatID, nil
 }
 
+func workspaceReorderPinnedChats(raw json.RawMessage) error {
+	var payload struct {
+		ChatIDs []string `json:"chatIds"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return err
+	}
+	state, err := workspaceStore().LoadState()
+	if err != nil {
+		return err
+	}
+	pinned := make(map[string]bool)
+	for chatID, chat := range state.ChatsByID {
+		if chat.Pinned && chat.DeletedAt == 0 && chat.ArchivedAt == 0 {
+			pinned[chatID] = true
+		}
+	}
+	if len(payload.ChatIDs) != len(pinned) {
+		return errors.New("chatIds must include every pinned chat")
+	}
+	seen := make(map[string]bool, len(payload.ChatIDs))
+	for _, chatID := range payload.ChatIDs {
+		if !pinned[chatID] {
+			return errors.New("chatIds contains an unknown or unpinned chat")
+		}
+		if seen[chatID] {
+			return errors.New("chatIds contains a duplicate chat")
+		}
+		seen[chatID] = true
+	}
+	event, err := events.New(events.TypeChatPinnedReordered, map[string]any{"chatIds": payload.ChatIDs})
+	if err != nil {
+		return err
+	}
+	return workspaceStore().Append(events.StreamChats, event)
+}
+
 func workspaceDeleteChat(raw json.RawMessage) (string, error) {
 	var payload struct {
 		ChatID string `json:"chatId"`
@@ -833,6 +870,25 @@ func workspaceNativeHistoryCacheLookup(key workspaceNativeHistoryCacheKey, modif
 	entry.lastAccess = time.Now()
 	workspaceNativeHistoryCache.items[key] = entry
 	return workspaceCloneNativeHistoryPage(entry.page), true
+}
+
+// workspaceInvalidateNativeHistoryCacheForChat is deliberately used only for
+// an explicit user refresh. The visible-chat poll keeps the cache hot, while a
+// user who asks to refresh session text must get a fresh parse even if an
+// external writer preserved the file size and timestamp resolution.
+func workspaceInvalidateNativeHistoryCacheForChat(chatID string) {
+	meta, ok, err := workspaceNativeTranscriptMetaForChat(chatID)
+	if err != nil || !ok || strings.TrimSpace(meta.TranscriptPath) == "" {
+		return
+	}
+	path := filepath.Clean(meta.TranscriptPath)
+	workspaceNativeHistoryCache.Lock()
+	defer workspaceNativeHistoryCache.Unlock()
+	for key := range workspaceNativeHistoryCache.items {
+		if key.path == path {
+			delete(workspaceNativeHistoryCache.items, key)
+		}
+	}
 }
 
 func workspaceNativeHistoryCacheStore(key workspaceNativeHistoryCacheKey, modifiedAt int64, size int64, page map[string]any) {

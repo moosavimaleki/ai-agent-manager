@@ -1,93 +1,42 @@
 import { describe, expect, test } from "bun:test"
-import { createElement } from "react"
-import { renderToStaticMarkup } from "react-dom/server"
-import type { SidebarChatRow, SidebarData } from "../../shared/types"
-import { I18nProvider } from "../i18n/context"
-import { getNewSidebarChatSections, getUsageOrderedSidebarChats, SidebarPrimaryControls } from "./AbolqasemSidebar"
+import type { SidebarProjectGroup } from "../../shared/types"
+import { getActiveSidebarChatLocation } from "./AbolqasemSidebar"
 
-function chat(chatId: string, lastMessageAt: number, unread: boolean): SidebarChatRow {
-  return {
+function group(
+  groupKey: string,
+  previewChatIds: string[],
+  olderChatIds: string[],
+): SidebarProjectGroup {
+  const chat = (chatId: string) => ({
     _id: chatId,
-    _creationTime: 1,
     chatId,
     title: chatId,
-    status: "idle",
-    unread,
-    localPath: "/tmp/project",
-    provider: "codex",
-    lastMessageAt,
-    hasAutomation: false,
-  }
-}
-
-function sidebarData(chats: SidebarChatRow[]): SidebarData {
+    localPath: "/project",
+    status: "idle" as const,
+  })
   return {
-    projectGroups: [{
-      groupKey: "project",
-      title: "Project",
-      realTitle: "Project",
-      localPath: "/tmp/project",
-      chats,
-      previewChats: [],
-      olderChats: [],
-      defaultCollapsed: false,
-    }],
+    groupKey,
+    title: groupKey,
+    realTitle: groupKey,
+    localPath: "/project",
+    chats: [...previewChatIds, ...olderChatIds].map(chat),
+    previewChats: previewChatIds.map(chat),
+    olderChats: olderChatIds.map(chat),
   }
 }
 
-describe("getUsageOrderedSidebarChats", () => {
-  test("keeps chat placement based on activity when unread is cleared", () => {
-    const olderUnread = chat("older", 100, true)
-    const newerRead = chat("newer", 200, false)
-
-    expect(getUsageOrderedSidebarChats(sidebarData([olderUnread, newerRead])).map(({ chat }) => chat.chatId))
-      .toEqual(["newer", "older"])
-
-    olderUnread.unread = false
-    expect(getUsageOrderedSidebarChats(sidebarData([olderUnread, newerRead])).map(({ chat }) => chat.chatId))
-      .toEqual(["newer", "older"])
+describe("getActiveSidebarChatLocation", () => {
+  test("identifies a visible chat in its project", () => {
+    expect(getActiveSidebarChatLocation([group("one", ["chat-1"], [])], "chat-1"))
+      .toEqual({ groupKey: "one", isOlderChat: false })
   })
 
-  test("groups runtime state without moving an idle unread chat when it is read", () => {
-    const idleUnread = chat("idle-unread", 300, true)
-    const running = { ...chat("running", 200, false), status: "running" as const }
-    const waiting = { ...chat("waiting", 100, false), status: "waiting_for_user" as const }
-    const data = sidebarData([waiting, idleUnread, running])
-
-    let sections = getNewSidebarChatSections(data)
-    expect(sections.active.map(({ chat }) => chat.chatId)).toEqual(["running"])
-    expect(sections.attention.map(({ chat }) => chat.chatId)).toEqual(["waiting"])
-    expect(sections.recent.map(({ chat }) => chat.chatId)).toEqual(["idle-unread"])
-
-    idleUnread.unread = false
-    sections = getNewSidebarChatSections(data)
-    expect(sections.recent.map(({ chat }) => chat.chatId)).toEqual(["idle-unread"])
+  test("identifies an older chat so its project page can be expanded before scrolling", () => {
+    expect(getActiveSidebarChatLocation([group("one", ["chat-1"], ["chat-2"])], "chat-2"))
+      .toEqual({ groupKey: "one", isOlderChat: true })
   })
-})
 
-describe("SidebarPrimaryControls", () => {
-  test("keeps search first after creation moves to the header pencil menu", () => {
-    const html = renderToStaticMarkup(createElement(
-      I18nProvider,
-      { locale: "fa" },
-      createElement(SidebarPrimaryControls, {
-        data: sidebarData([]),
-        locale: "fa",
-        sidebarView: "chats",
-        onChangeView: () => undefined,
-        onSelectChat: () => undefined,
-      }),
-    ))
-
-    const searchIndex = html.indexOf('data-sidebar-control="search"')
-    const filterIndex = html.indexOf('data-sidebar-control="view-filter"')
-
-    expect(searchIndex).toBeGreaterThanOrEqual(0)
-    expect(filterIndex).toBeGreaterThan(searchIndex)
-    expect(html.match(/>چت‌ها</g)).toHaveLength(1)
-    expect(html).not.toContain('data-sidebar-control="actions"')
-    expect(html).not.toContain('data-sidebar-action="new-chat"')
-    expect(html).not.toContain('data-sidebar-action="add-project"')
-    expect(html).not.toContain('bg-muted/55')
+  test("does not expand an unrelated project", () => {
+    expect(getActiveSidebarChatLocation([group("one", ["chat-1"], [])], "chat-2")).toBeNull()
   })
 })

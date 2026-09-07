@@ -167,6 +167,36 @@ func TestWorkspaceComposerQueuesAndCancels(t *testing.T) {
 	}
 }
 
+func TestWorkspaceComposerDeduplicatesQueuedDeliveryRequest(t *testing.T) {
+	withWorkspaceComposerStore(t)
+
+	project, err := workspaceOpenProject("/tmp/queued-delivery", "Queued delivery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chat, err := workspaceCreateChat(project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &workspaceEventStore{store: workspaceStore()}
+	message := agent.QueueMessageInput{RequestID: "delivery-1", Content: "send once"}
+	first, err := store.EnqueueMessage(chat.ID, message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.EnqueueMessage(chat.ID, message)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if first.ID != "queued-delivery-1" || second.ID != first.ID {
+		t.Fatalf("expected stable queued message ID, got first=%q second=%q", first.ID, second.ID)
+	}
+	if queued := store.GetQueuedMessages(chat.ID); len(queued) != 1 {
+		t.Fatalf("expected one persisted queued message, got %#v", queued)
+	}
+}
+
 func TestWorkspaceRuntimeEventsUpdateSnapshots(t *testing.T) {
 	withWorkspaceComposerStore(t)
 

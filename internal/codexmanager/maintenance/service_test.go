@@ -50,8 +50,39 @@ func TestRunSkipsActiveRefreshAndWritesStatus(t *testing.T) {
 	if _, err := repo.Paths.Status("other"); err != nil {
 		t.Fatal(err)
 	}
+	status, err := repo.Status("other")
+	if err != nil || status.State != account.StateReady || status.Message != "" || status.RateLimits == nil {
+		t.Fatalf("successful quota check must not persist refresh diagnostics: status=%#v err=%v", status, err)
+	}
 	store := history.Store{Paths: storage.Paths{Home: home}}
 	if _, err := store.Read("other", time.Time{}, 10); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRunPersistsAuthenticationFailureInsteadOfLeavingOldReadyStatus(t *testing.T) {
+	httpServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer httpServer.Close()
+	home := t.TempDir()
+	repo := account.Repository{Paths: storage.Paths{Home: home}}
+	ctx := context.Background()
+	if err := repo.Add(ctx, "broken", authFixture("broken"), false); err != nil {
+		t.Fatal(err)
+	}
+	old := limits.Snapshot{Account: "broken", FetchedAt: time.Now().UTC(), Limits: []limits.Limit{{ID: "codex", Windows: []limits.Window{{Label: "5h", RemainingPercent: 100}}}}}
+	if err := repo.RecordCheckStatus(ctx, "broken", account.StateReady, "old success", old.FetchedAt, &old); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 4, 10, 0, 0, 0, time.UTC)
+	service := Service{Accounts: repo, Limits: limits.Client{URL: httpServer.URL, Now: func() time.Time { return now }}, History: history.Store{Paths: storage.Paths{Home: home}}, Config: Config{Now: func() time.Time { return now }}}
+	summary, err := service.Run(ctx)
+	if err != nil || len(summary.Results) != 1 || summary.Results[0].State != "needs_login" {
+		t.Fatalf("summary=%#v err=%v", summary, err)
+	}
+	status, err := repo.Status("broken")
+	if err != nil || status.State != account.StateNeedsLogin || status.CheckedAt == nil || !status.CheckedAt.Equal(now) || status.RateLimits != nil {
+		t.Fatalf("status=%#v err=%v", status, err)
 	}
 }

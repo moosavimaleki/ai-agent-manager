@@ -21,11 +21,13 @@ type Profile = {
   id: string;
   name: string;
   accounts?: Record<string, string>;
-  outcome?: "signed_in" | "partial" | "signed_out" | "error" | "pending";
+  outcome?: "signed_in" | "partial" | "signed_out" | "error" | "missing" | "pending";
   activeEmail?: string;
   managedAccount?: string;
   managedPlan?: string;
   savedAccounts?: string[];
+  lastActiveEmail?: string;
+  lastManagedAccount?: string;
   reason?: string;
 };
 
@@ -82,6 +84,11 @@ function statusFor(profile: Profile, locale: AppLocale) {
     case "error":
       return {
         label: t(locale, "قابل بررسی نیست", "Check failed"),
+        className: "border-destructive/30 bg-destructive/10 text-destructive",
+      };
+    case "missing":
+      return {
+        label: t(locale, "پروفایل در دسترس نیست", "Profile unavailable"),
         className: "border-destructive/30 bg-destructive/10 text-destructive",
       };
     case "pending":
@@ -348,7 +355,7 @@ export function BrowserSessionsPanel({
         aria-label={t(locale, "فهرست پروفایل‌های Chrome", "Chrome profiles")}
       >
         <div
-          className="hidden grid-cols-[7rem_minmax(9rem,1fr)_minmax(13rem,1.5fr)_minmax(10rem,1fr)_5.5rem] gap-3 border-b border-border bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground sm:grid"
+          className="hidden grid-cols-[7rem_minmax(8rem,1fr)_minmax(10rem,1.25fr)_minmax(10rem,1.25fr)_minmax(10rem,1.25fr)_5.5rem] gap-3 border-b border-border bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground xl:grid"
           role="row"
         >
           <span role="columnheader">{t(locale, "وضعیت", "Status")}</span>
@@ -357,18 +364,22 @@ export function BrowserSessionsPanel({
             {t(locale, "حساب فعال ChatGPT", "Active ChatGPT account")}
           </span>
           <span role="columnheader">
-            {t(locale, "حساب‌های ذخیره‌شده", "Saved accounts")}
+            {t(locale, "آخرین حساب این Chrome", "Last account in this Chrome")}
+          </span>
+          <span role="columnheader">
+            {t(locale, "حساب‌های Codex مرتبط", "Associated Codex accounts")}
           </span>
           <span aria-hidden="true" />
         </div>
         {profiles.map((profile) => {
           const status = statusFor(profile, locale);
           const isSelected = profile.id === selected;
+          const linkedAccounts = Object.entries(profile.accounts ?? {});
           return (
             <div
               key={profile.id}
               role="row"
-              className={`grid gap-2 border-b border-border/60 px-3 py-2.5 text-start text-xs last:border-b-0 sm:grid-cols-[7rem_minmax(9rem,1fr)_minmax(13rem,1.5fr)_minmax(10rem,1fr)_5.5rem] sm:items-center ${isSelected ? "bg-primary/5" : "hover:bg-muted/40"}`}
+              className={`grid gap-2 border-b border-border/60 px-3 py-2.5 text-start text-xs last:border-b-0 xl:grid-cols-[7rem_minmax(8rem,1fr)_minmax(10rem,1.25fr)_minmax(10rem,1.25fr)_minmax(10rem,1.25fr)_5.5rem] xl:items-center ${isSelected ? "bg-primary/5" : "hover:bg-muted/40"}`}
             >
               <button
                 type="button"
@@ -400,10 +411,24 @@ export function BrowserSessionsPanel({
               </span>
               <span
                 role="cell"
-                className="truncate text-muted-foreground"
-                dir="ltr"
+                className="min-w-0 text-muted-foreground"
               >
-                {profile.savedAccounts?.join(", ") || "—"}
+                {profile.lastActiveEmail ? (
+                  <span className="block truncate" dir="ltr" title={profile.lastActiveEmail}>
+                    {profile.lastActiveEmail}
+                    {profile.lastManagedAccount ? ` · ${profile.lastManagedAccount}` : ""}
+                  </span>
+                ) : "—"}
+              </span>
+              <span
+                role="cell"
+                className="min-w-0 text-muted-foreground"
+              >
+                {linkedAccounts.length ? (
+                  <span className="block truncate" title={linkedAccounts.map(([email, name]) => `${name} (${email})`).join(", ")}>
+                    {linkedAccounts.map(([email, name]) => `${name} · ${email}`).join(", ")}
+                  </span>
+                ) : "—"}
               </span>
               </button>
               <span role="cell" className="flex justify-end">
@@ -414,7 +439,7 @@ export function BrowserSessionsPanel({
                     setSelected(profile.id);
                     void openSelectedProfile(profile.id);
                   }}
-                  disabled={loading || scanning}
+                  disabled={loading || scanning || profile.outcome === "missing"}
                   aria-label={t(locale, `باز کردن Chrome با پروفایل ${profile.name}`, `Open Chrome profile ${profile.name}`)}
                 >
                   <ExternalLink className="size-3.5" />
@@ -450,7 +475,7 @@ export function BrowserSessionsPanel({
                 size="sm"
                 variant="ghost"
                 onClick={() => void openSelectedProfile()}
-                disabled={loading || scanning}
+                disabled={loading || scanning || selectedProfile.outcome === "missing"}
               >
                 <ExternalLink className="size-3.5" />
                 {t(locale, "باز کردن Chrome", "Open Chrome")}

@@ -24,7 +24,7 @@ func Select(candidates []Candidate, now time.Time) Selection {
 	}
 	healthy := 0
 	for _, candidate := range candidates {
-		if candidate.State != account.StateNeedsLogin && candidate.State != account.StateError && codexLimit(candidate.Limits) != nil {
+		if candidate.State == account.StateReady && codexLimit(candidate.Limits) != nil {
 			healthy++
 		}
 	}
@@ -73,6 +73,9 @@ func Select(candidates []Candidate, now time.Time) Selection {
 func score(candidate Candidate, healthyCount int, now time.Time) Result {
 	if candidate.State == account.StateNeedsLogin || candidate.State == account.StateError {
 		return Result{Account: candidate.Name, Label: Login, Reason: string(candidate.State), Score: -math.MaxFloat64}
+	}
+	if candidate.State == account.StateStale {
+		return Result{Account: candidate.Name, Label: Stale, Reason: "account verification is stale; refresh limits before activation", Score: -math.MaxFloat64}
 	}
 	limit := codexLimit(candidate.Limits)
 	if limit == nil {
@@ -133,6 +136,10 @@ func score(candidate Candidate, healthyCount int, now time.Time) Result {
 	}
 	return Result{Account: candidate.Name, Label: label, Score: score, Reason: reason, Recommendable: !protected && !veryStale, Remaining: pacing.RemainingPercent, Target: target, Health: health, PacingLabel: pacing.Label}
 }
+
+// EmptySnapshot makes it explicit that recommendation must never consult
+// historical samples after a failed or missing live verification.
+func EmptySnapshot(accountName string) limits.Snapshot { return limits.Snapshot{Account: accountName} }
 
 func codexLimit(snapshot limits.Snapshot) *limits.Limit {
 	for index := range snapshot.Limits {

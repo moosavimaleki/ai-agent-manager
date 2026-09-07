@@ -96,8 +96,18 @@ func (m *Manager) Recommendation(now time.Time) (recommendation.Selection, error
 		if readErr != nil {
 			continue
 		}
+		status, statusErr := m.Accounts.Status(name)
+		if statusErr != nil {
+			// A damaged status file is never a reason to resurrect historical
+			// quota data. Surface it as stale until an explicit check repairs it.
+			status = account.Status{State: account.StateStale, Message: "account status is unreadable; verify it again"}
+		}
 		metadata := accountMetadata(credentials)
-		candidates = append(candidates, recommendation.Candidate{Name: name, Plan: metadata.plan, State: account.StateReady, Limits: m.readLatestLimit(name)})
+		limitSnapshot := recommendation.EmptySnapshot(name)
+		if status.RateLimits != nil {
+			limitSnapshot = *status.RateLimits
+		}
+		candidates = append(candidates, recommendation.Candidate{Name: name, Plan: metadata.plan, State: status.State, Limits: limitSnapshot})
 	}
 	return recommendation.Select(candidates, now), nil
 }
@@ -135,16 +145,4 @@ func accountMetadata(raw map[string]any) metadata {
 		return metadata{plan: account.PlanPlus}
 	}
 	return metadata{plan: account.PlanUnknown}
-}
-
-func (m *Manager) readLatestLimit(name string) limits.Snapshot {
-	rows, err := m.History.Read(name, time.Time{}, 1)
-	if err != nil || len(rows) == 0 {
-		return limits.Snapshot{Account: name}
-	}
-	windows := make([]limits.Window, 0, len(rows[0].Windows))
-	for label, remaining := range rows[0].Windows {
-		windows = append(windows, limits.Window{Label: label, RemainingPercent: remaining})
-	}
-	return limits.Snapshot{Account: name, FetchedAt: rows[0].At, Limits: []limits.Limit{{ID: "codex", Windows: windows}}}
 }

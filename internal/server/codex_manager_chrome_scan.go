@@ -110,10 +110,15 @@ func codexManagerRefreshChromeScan(ctx context.Context) (codexManagerChromeScanS
 	if err != nil {
 		settings = state.DefaultAppSettings()
 	}
+	accounts := redactCodexManagerAccounts(account.Repository{Paths: codexManagerPaths()})
 	managed := make(map[string]account.Account)
-	for _, item := range redactCodexManagerAccounts(account.Repository{Paths: codexManagerPaths()}) {
+	historical := make(map[string][]account.Account)
+	for _, item := range accounts {
 		if email := strings.ToLower(strings.TrimSpace(item.Email)); email != "" {
 			managed[email] = item
+		}
+		if item.ChromeProfile != nil && item.ChromeProfile.ID != "" {
+			historical[item.ChromeProfile.ID] = append(historical[item.ChromeProfile.ID], item)
 		}
 	}
 	items := make([]map[string]any, len(profiles))
@@ -130,19 +135,69 @@ func codexManagerRefreshChromeScan(ctx context.Context) (codexManagerChromeScanS
 				return
 			}
 			defer func() { <-semaphore }()
-			items[index] = codexManagerScanChromeProfile(ctx, profile, managed, settings.CodexBackend.Maintenance.ProxyURL)
+			items[index] = codexManagerScanChromeProfile(ctx, profile, managed, historical[profile.ID], settings.CodexBackend.Maintenance.ProxyURL)
 		}(index, profile)
 	}
 	wait.Wait()
 	if err := ctx.Err(); err != nil && !errors.Is(err, context.Canceled) {
 		return codexManagerChromeScanSnapshot{}, err
 	}
+	items = codexManagerAppendMissingChromeProfiles(items, accounts)
 	value := codexManagerChromeScanSnapshot{Profiles: items, ScannedAt: time.Now().UTC()}
 	if err := codexManagerStoreChromeProfileAssociations(value); err != nil {
 		return codexManagerChromeScanSnapshot{}, err
 	}
 	codexManagerStoreChromeScan(value)
 	return value, nil
+}
+
+// codexManagerAppendMissingChromeProfiles keeps historical associations in the
+// Chrome table when a profile was deleted, moved, or no longer has a cookie
+// database. It is a read-only UI projection: opening such a row still fails
+// safely until Chrome recreates that profile.
+func codexManagerAppendMissingChromeProfiles(profiles []map[string]any, accounts []account.Account) []map[string]any {
+	known := make(map[string]int, len(profiles))
+	for index, profile := range profiles {
+		if id, _ := profile["id"].(string); id != "" {
+			known[id] = index
+		}
+	}
+	for _, item := range accounts {
+		association := item.ChromeProfile
+		if association == nil || association.ID == "" || association.Name == "" {
+			continue
+		}
+		if index, exists := known[association.ID]; exists {
+			profile := profiles[index]
+			if profile["outcome"] == "missing" {
+				linked, _ := profile["accounts"].(map[string]string)
+				if linked == nil {
+					linked = map[string]string{}
+				}
+				if email := strings.ToLower(strings.TrimSpace(item.Email)); email != "" {
+					linked[email] = item.Name
+				}
+				profile["accounts"] = linked
+			}
+			continue
+		}
+		email := strings.ToLower(strings.TrimSpace(item.Email))
+		linked := map[string]string{}
+		if email != "" {
+			linked[email] = item.Name
+		}
+		profiles = append(profiles, map[string]any{
+			"id":                 association.ID,
+			"name":               association.Name,
+			"outcome":            "missing",
+			"reason":             "Chrome profile is no longer available on this device",
+			"accounts":           linked,
+			"lastActiveEmail":    association.LastActiveEmail,
+			"lastManagedAccount": association.LastManagedAccount,
+		})
+		known[association.ID] = len(profiles) - 1
+	}
+	return profiles
 }
 
 // codexManagerStoreChromeProfileAssociations retains the last profile known
@@ -162,6 +217,18 @@ func codexManagerStoreChromeProfileAssociations(snapshot codexManagerChromeScanS
 		}
 		if name, _ := profile["managedAccount"].(string); name != "" {
 			linked[name] = profile
+		}
+		if accounts, _ := profile["accounts"].(map[string]string); accounts != nil {
+			for _, name := range accounts {
+				if _, found := linked[name]; !found && name != "" {
+					linked[name] = profile
+				}
+			}
+		}
+		if name, _ := profile["lastManagedAccount"].(string); name != "" {
+			if _, found := linked[name]; !found {
+				linked[name] = profile
+			}
 		}
 	}
 	for _, item := range accounts {
@@ -204,12 +271,18 @@ func codexManagerStoreChromeProfileAssociations(snapshot codexManagerChromeScanS
 		name, _ := profile["name"].(string)
 		outcome, _ := profile["outcome"].(string)
 		activeEmail, _ := profile["activeEmail"].(string)
-		if linked[item.Name] == nil && outcome == "signed_in" {
+		if managedName, _ := profile["managedAccount"].(string); managedName != item.Name && outcome == "signed_in" {
 			// The profile still works, but it is signed in as somebody else. Keep
 			// the historical association and make the mismatch explicit to the UI.
 			outcome = "changed"
 		}
 		entry := map[string]any{"id": id, "name": name, "outcome": outcome, "activeEmail": activeEmail, "lastCheckedAt": snapshot.ScannedAt}
+		if lastActiveEmail, _ := profile["lastActiveEmail"].(string); lastActiveEmail != "" {
+			entry["lastActiveEmail"] = lastActiveEmail
+		}
+		if lastManagedAccount, _ := profile["lastManagedAccount"].(string); lastManagedAccount != "" {
+			entry["lastManagedAccount"] = lastManagedAccount
+		}
 		if linked[item.Name] != nil {
 			entry["lastSeenAt"] = snapshot.ScannedAt
 		} else if previous != nil {

@@ -40,18 +40,34 @@ type Account struct {
 	ChromeProfile  *ChromeProfile   `json:"chromeProfile,omitempty"`
 }
 
+// Status is the persisted, token-free result of the most recent live account
+// verification. It is deliberately separate from Account so the same exact
+// projection can drive both the HTTP dashboard and automatic selection.
+// Missing or unreadable status is stale, never implicitly ready.
+type Status struct {
+	State                  State
+	Message                string
+	CheckedAt              *time.Time
+	RateLimits             *limits.Snapshot
+	SessionMonitor         *SessionMonitor
+	SessionMonitorDisabled bool
+	ChromeProfile          *ChromeProfile
+}
+
 // ChromeProfile is the last safe association between a managed Codex account
 // and a local Chrome profile. It deliberately contains no filesystem path,
 // cookies, or browser tokens. Keeping the association lets the UI show the
 // profile that last held an account even after that browser profile changes
 // its ChatGPT login.
 type ChromeProfile struct {
-	ID            string     `json:"id"`
-	Name          string     `json:"name"`
-	Outcome       string     `json:"outcome"`
-	ActiveEmail   string     `json:"activeEmail,omitempty"`
-	LastSeenAt    *time.Time `json:"lastSeenAt,omitempty"`
-	LastCheckedAt *time.Time `json:"lastCheckedAt,omitempty"`
+	ID                 string     `json:"id"`
+	Name               string     `json:"name"`
+	Outcome            string     `json:"outcome"`
+	ActiveEmail        string     `json:"activeEmail,omitempty"`
+	LastActiveEmail    string     `json:"lastActiveEmail,omitempty"`
+	LastManagedAccount string     `json:"lastManagedAccount,omitempty"`
+	LastSeenAt         *time.Time `json:"lastSeenAt,omitempty"`
+	LastCheckedAt      *time.Time `json:"lastCheckedAt,omitempty"`
 }
 
 // SessionMonitor is the safe, per-account projection of Chrome's Codex

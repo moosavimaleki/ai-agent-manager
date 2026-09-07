@@ -504,8 +504,18 @@ func (s *workspaceEventStore) RecordTurnCancelled(chatID string) error {
 
 func (s *workspaceEventStore) EnqueueMessage(chatID string, message agent.QueueMessageInput) (readmodels.QueuedChatMessage, error) {
 	now := time.Now().UnixMilli()
+	queuedID := ""
+	if requestID := strings.TrimSpace(message.RequestID); requestID != "" {
+		queuedID = "queued-" + requestID
+		if existing, ok := s.GetQueuedMessage(chatID, queuedID); ok {
+			return existing, nil
+		}
+	}
+	if queuedID == "" {
+		queuedID = "queued-" + randomID()
+	}
 	queued := readmodels.QueuedChatMessage{
-		ID:           "queued-" + randomID(),
+		ID:           queuedID,
 		Content:      message.Content,
 		Attachments:  append(make([]readmodels.ChatAttachment, 0, len(message.Attachments)), message.Attachments...),
 		CreatedAt:    now,
@@ -778,6 +788,21 @@ func decodeChatID(raw json.RawMessage) (string, error) {
 		return "", errors.New("chatId is required")
 	}
 	return payload.ChatID, nil
+}
+
+func decodeChatRefreshCommand(raw json.RawMessage) (string, bool, error) {
+	var payload struct {
+		ChatID                 string `json:"chatId"`
+		ForceTranscriptRefresh bool   `json:"forceTranscriptRefresh"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return "", false, err
+	}
+	chatID := strings.TrimSpace(payload.ChatID)
+	if chatID == "" {
+		return "", false, errors.New("chatId is required")
+	}
+	return chatID, payload.ForceTranscriptRefresh, nil
 }
 
 func decodeQueuedMessageCommand(raw json.RawMessage) (string, string, error) {

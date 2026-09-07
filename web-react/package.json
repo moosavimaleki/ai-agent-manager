@@ -17,7 +17,7 @@
   ],
   "scripts": {
     "build": "npm run build:client && npm run build:export-viewer",
-    "build:client": "vite build",
+    "build:client": "vite build && node scripts/check-startup-budget.mjs",
     "build:export-viewer": "vite build --config vite.export-viewer.config.ts",
     "check": "tsc --noEmit && npm run build:client && npm run build:export-viewer",
     "dev:client": "vite --host 0.0.0.0 --port 5174",

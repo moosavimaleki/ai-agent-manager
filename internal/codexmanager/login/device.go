@@ -111,6 +111,15 @@ func (s Service) Login(ctx context.Context, name string, replace bool, expectedE
 	if err := s.Accounts.Add(ctx, name, authData, replace); err != nil {
 		return Result{}, err
 	}
+	// The credentials just changed. Any previous quota snapshot belongs to the
+	// old token and must never be shown as valid while the dashboard refreshes.
+	now := time.Now
+	if s.Now != nil {
+		now = s.Now
+	}
+	if err := s.Accounts.MarkVerificationPendingAfterCredentialChange(ctx, name, now().UTC()); err != nil {
+		return Result{}, err
+	}
 	return Result{Name: name, Email: metadata["email"], AccountID: metadata["account_id"], Replaced: replace}, nil
 }
 

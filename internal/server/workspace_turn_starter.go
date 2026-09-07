@@ -38,6 +38,8 @@ type workspaceTurnStarter struct {
 var workspaceCodexSessions = newWorkspaceCodexSessionManager()
 var workspaceLoadProviderSettings = state.LoadSettings
 
+const workspaceCodexStartupRPCTimeout = 45 * time.Second
+
 // workspaceCodexCredentialSwitch prevents a new turn from taking ownership of
 // an app-server while a user is atomically replacing ~/.codex/auth.json. A
 // read lock is held until the turn owns session.turnMu; a writer therefore
@@ -641,7 +643,9 @@ func runWorkspaceCodexTurn(ctx context.Context, turnCancel context.CancelFunc, r
 	// Keep the credential-switch read lock through acquisition of turnMu. This
 	// makes an account switch all-or-nothing relative to a new turn.
 	workspaceCodexCredentialSwitch.RLock()
-	session, err := workspaceCodexSessions.session(ctx, request)
+	sessionCtx, cancelSession := context.WithTimeout(ctx, workspaceCodexStartupRPCTimeout)
+	session, err := workspaceCodexSessions.session(sessionCtx, request)
+	cancelSession()
 	if err != nil {
 		workspaceCodexCredentialSwitch.RUnlock()
 		turn.events <- agent.TurnEvent{Type: agent.TurnEventFailed, Error: err}
@@ -657,7 +661,9 @@ func runWorkspaceCodexTurn(ctx context.Context, turnCancel context.CancelFunc, r
 		turn.events <- agent.TurnEvent{Type: agent.TurnEventSessionToken, SessionToken: threadID}
 	}
 
-	turnID, err := process.StartTurn(ctx, threadID, request)
+	startCtx, cancelStart := context.WithTimeout(ctx, workspaceCodexStartupRPCTimeout)
+	turnID, err := process.StartTurn(startCtx, threadID, request)
+	cancelStart()
 	if err != nil {
 		workspaceCodexSessions.remove(request.ChatID, process)
 		process.Close()
@@ -754,6 +760,7 @@ func startWorkspaceCodexProcess(ctx context.Context, cwd string, env []string) (
 		process.doneMu.Lock()
 		process.doneErr = err
 		process.doneMu.Unlock()
+		process.client.Close(err)
 		close(process.done)
 	}()
 	return process, nil

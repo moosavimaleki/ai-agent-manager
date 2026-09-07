@@ -11,8 +11,9 @@ import { getSidebarChatTimestamp } from "../lib/sidebarChats"
 import { cn } from "../lib/utils"
 import { ChatRow } from "../components/chat-ui/sidebar/ChatRow"
 import { LocalProjectsSection } from "../components/chat-ui/sidebar/LocalProjectsSection"
+import { getPinnedChatsInUserOrder, PinnedChatsSection } from "../components/chat-ui/sidebar/PinnedChatsSection"
 import { getResolvedKeybindings } from "../lib/keybindings"
-import type { AgentProvider, AppLocale, KeybindingsSnapshot, SidebarData, SidebarChatRow, UpdateSnapshot } from "../../shared/types"
+import type { AgentProvider, AppLocale, KeybindingsSnapshot, SidebarData, SidebarChatRow, SidebarProjectGroup, UpdateSnapshot } from "../../shared/types"
 import type { SocketStatus } from "./socket"
 import {
   getSidebarJumpTargetIndex,
@@ -427,6 +428,7 @@ interface AbolqasemSidebarProps {
   onRenameChat: (chat: SidebarChatRow) => void
   onArchiveChat: (chat: SidebarChatRow) => void
   onPinChat?: (chat: SidebarChatRow) => void
+  onReorderPinnedChats: (chatIds: string[]) => Promise<void>
   onOpenArchivedChat: (chatId: string) => void
   onDeleteChat: (chat: SidebarChatRow) => void
   onOpenAddProjectModal: () => void
@@ -489,6 +491,22 @@ export function getNewSidebarChatSections(data: SidebarData) {
   return { active, attention, recent }
 }
 
+export function getActiveSidebarChatLocation(
+  projectGroups: SidebarProjectGroup[],
+  activeChatId: string | null,
+) {
+  if (!activeChatId) return null
+  for (const group of projectGroups) {
+    if (group.previewChats.some((chat) => chat.chatId === activeChatId)) {
+      return { groupKey: group.groupKey, isOlderChat: false }
+    }
+    if (group.olderChats.some((chat) => chat.chatId === activeChatId)) {
+      return { groupKey: group.groupKey, isOlderChat: true }
+    }
+  }
+  return null
+}
+
 function chatIdForSearchResult(data: SidebarData, result: BackendSearchResult) {
   if (result.chat_id) return result.chat_id
   return allSidebarSearchChats(data).find(({ chat }) => chat.legacySessionKey === result.key)?.chat.chatId ?? null
@@ -516,6 +534,7 @@ function AbolqasemSidebarImpl({
   onRenameChat,
   onArchiveChat,
   onPinChat = () => undefined,
+  onReorderPinnedChats,
   onOpenArchivedChat,
   onDeleteChat,
   onOpenAddProjectModal,
@@ -542,6 +561,7 @@ function AbolqasemSidebarImpl({
   const [sidebarWidth, setSidebarWidth] = useState(readStoredSidebarWidth)
   const [isResizingSidebar, setIsResizingSidebar] = useState(false)
   const [archivedProjectId, setArchivedProjectId] = useState<string | null>(null)
+  const [optimisticPinnedChatOrder, setOptimisticPinnedChatOrder] = useState<string[] | null>(null)
   const [sidebarView, setSidebarView] = useState<SidebarView>(readStoredSidebarView)
   const [diskWarning, setDiskWarning] = useState<{ total: number; threshold: number } | null>(null)
   const resolvedKeybindings = useMemo(() => getResolvedKeybindings(keybindings), [keybindings])
@@ -587,12 +607,32 @@ function AbolqasemSidebarImpl({
     () => getUsageOrderedSidebarChats(data),
     [data],
   )
+  const sidebarChats = useMemo(() => flatChats.map(({ chat }) => chat), [flatChats])
+  const serverPinnedChatOrder = useMemo(
+    () => getPinnedChatsInUserOrder(sidebarChats).map((chat) => chat.chatId),
+    [sidebarChats],
+  )
   const chatSections = useMemo(() => getNewSidebarChatSections(data), [data])
+  const activeChatLocation = useMemo(
+    () => getActiveSidebarChatLocation(data.projectGroups, activeChatId),
+    [activeChatId, data.projectGroups],
+  )
 
   const changeSidebarView = useCallback((view: SidebarView) => {
     setSidebarView(view)
     window.localStorage.setItem(SIDEBAR_VIEW_STORAGE_KEY, view)
   }, [])
+
+  useEffect(() => {
+    if (!optimisticPinnedChatOrder) return
+    if (
+      optimisticPinnedChatOrder.length !== serverPinnedChatOrder.length
+      || optimisticPinnedChatOrder.some((chatID, index) => chatID !== serverPinnedChatOrder[index])
+    ) {
+      return
+    }
+    setOptimisticPinnedChatOrder(null)
+  }, [optimisticPinnedChatOrder, serverPinnedChatOrder])
 
   useEffect(() => {
     visibleChatsRef.current = visibleChats
@@ -629,6 +669,26 @@ function AbolqasemSidebarImpl({
       return next
     })
   }, [data.projectGroups])
+
+  // A route can select a chat before its project section has mounted. Reveal
+  // the owning project (and its older-chat page) first; the scroll effect
+  // below then runs again after this render rather than silently missing it.
+  useEffect(() => {
+    if (!activeChatLocation) return
+
+    setCollapsedSections((previous) => {
+      if (!previous.has(activeChatLocation.groupKey)) return previous
+      const next = new Set(previous)
+      next.delete(activeChatLocation.groupKey)
+      return next
+    })
+    if (activeChatLocation.isOlderChat) {
+      setExpandedGroups((previous) => {
+        if (previous.has(activeChatLocation.groupKey)) return previous
+        return new Set(previous).add(activeChatLocation.groupKey)
+      })
+    }
+  }, [activeChatLocation])
 
   const toggleSection = useCallback((key: string) => {
     setCollapsedSections((previous) => {
@@ -680,6 +740,13 @@ function AbolqasemSidebarImpl({
       />
     )
   }, [activeChatId, navigate, nowMs, onArchiveChat, onClose, onConvertChat, onDeleteChat, onForkChat, onOpenExternalPath, onPinChat, onRenameChat, pendingArchiveChatIds, resolvedKeybindings, showNumberJumpHints, visibleIndexByChatId])
+
+  const reorderPinnedChats = useCallback((chatIds: string[]) => {
+    setOptimisticPinnedChatOrder(chatIds)
+    void onReorderPinnedChats(chatIds).catch(() => {
+      setOptimisticPinnedChatOrder(null)
+    })
+  }, [onReorderPinnedChats])
 
   useEffect(() => {
     const intervalId = window.setInterval(() => {
@@ -750,7 +817,9 @@ function AbolqasemSidebarImpl({
 
     requestAnimationFrame(() => {
       const container = scrollContainerRef.current
-      const activeElement = container?.querySelector(`[data-chat-id="${activeChatId}"]`) as HTMLElement | null
+      const activeElement = Array.from(
+        container?.querySelectorAll<HTMLElement>("[data-chat-id]") ?? [],
+      ).find((element) => element.dataset.chatId === activeChatId) ?? null
       if (!activeElement || !container) return
 
       const elementRect = activeElement.getBoundingClientRect()
@@ -765,7 +834,15 @@ function AbolqasemSidebarImpl({
         container.scrollTo({ top: elementCenter - containerCenter, behavior: "smooth" })
       }
     })
-  }, [activeChatId])
+  }, [
+    activeChatId,
+    activeChatLocation,
+    collapsed,
+    collapsedSections,
+    expandedGroups,
+    open,
+    sidebarView,
+  ])
 
   useEffect(() => {
     if (!isResizingSidebar) return
@@ -946,6 +1023,13 @@ function AbolqasemSidebarImpl({
           }}
         >
           <div className="px-[7px] py-1.5">
+            <PinnedChatsSection
+              chats={sidebarChats}
+              orderedChatIds={optimisticPinnedChatOrder ?? undefined}
+              renderChatRow={renderChatRow}
+              onUnpin={onPinChat}
+              onReorder={reorderPinnedChats}
+            />
             {!hasVisibleChats && isConnecting ? (
               <div className="space-y-5 px-1 pt-3">
                 {[0, 1, 2].map((section) => (

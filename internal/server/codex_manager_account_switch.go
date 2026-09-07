@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"abolqasem/internal/codexmanager"
 	"abolqasem/internal/codexmanager/account"
@@ -61,6 +63,9 @@ func switchCodexManagerLiveAccountWithResult(ctx context.Context, repository acc
 	_, _ = syncCodexManagerLiveAccount(ctx, repository)
 	if err := repository.ActivateLive(ctx, name, liveAuthPath); err != nil {
 		return false, err
+	}
+	if err := repository.MarkVerificationPending(ctx, name, time.Now().UTC()); err != nil {
+		return false, fmt.Errorf("mark activated account for verification: %w", err)
 	}
 	after, err := readCodexManagerLiveAuth(liveAuthPath)
 	if err != nil {

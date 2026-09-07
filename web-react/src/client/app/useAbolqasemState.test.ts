@@ -5,6 +5,7 @@ import {
   getActiveChatSnapshot,
   getActiveChatRefreshDelay,
   getComposerStateForActiveProvider,
+  fetchFreshChatTranscript,
   getNextMeasuredInputHeight,
   getNewestRemainingChatId,
   getPreviousPrompt,
@@ -27,6 +28,8 @@ import {
   shouldAutoFollowTranscript,
   ACTIVE_CHAT_REFRESH_INTERVAL_MS,
   BACKGROUND_CHAT_REFRESH_INTERVAL_MS,
+  CHAT_HISTORY_PAGE_SIZE,
+  INITIAL_CHAT_RECENT_LIMIT,
 } from "./useAbolqasemState"
 import type { ChatAttachment, ChatProviderPreferences, ChatSnapshot, QueuedChatMessage, SidebarData, UserPromptEntry } from "../../shared/types"
 
@@ -446,6 +449,13 @@ describe("getActiveChatSnapshot", () => {
   })
 })
 
+describe("transcript startup budget", () => {
+  test("keeps initial hydration and each history page bounded", () => {
+    expect(INITIAL_CHAT_RECENT_LIMIT).toBe(50)
+    expect(CHAT_HISTORY_PAGE_SIZE).toBe(100)
+  })
+})
+
 describe("normalizeChatSnapshot", () => {
   test("coerces nullable server arrays to empty arrays", () => {
     const snapshot = {
@@ -473,7 +483,7 @@ describe("normalizeChatSnapshot", () => {
     expect(normalized?.history).toEqual({
       hasOlder: false,
       olderCursor: null,
-      recentLimit: 200,
+      recentLimit: INITIAL_CHAT_RECENT_LIMIT,
     })
     expect(normalized?.availableProviders).toEqual([])
   })
@@ -514,6 +524,45 @@ describe("normalizeChatSnapshot", () => {
       attachments: [],
       createdAt: 1,
     }])
+  })
+})
+
+describe("fetchFreshChatTranscript", () => {
+  test("uses the local HTTP snapshot endpoint instead of the WebSocket", async () => {
+    let requestedPath = ""
+    let requestedMethod = ""
+    const snapshot = {
+      runtime: {
+        chatId: "chat one",
+        projectId: "project-1",
+        localPath: "/tmp/project-1",
+        title: "Chat 1",
+        status: "idle",
+        isDraining: false,
+        provider: "codex",
+        planMode: false,
+        sessionToken: null,
+      },
+      queuedMessages: [],
+      messages: [],
+      history: { hasOlder: false, olderCursor: null, recentLimit: 50 },
+      availableProviders: [],
+    } as unknown as ChatSnapshot
+
+    const result = await fetchFreshChatTranscript(snapshot.runtime.chatId, async (input, init) => {
+      requestedPath = String(input)
+      requestedMethod = init?.method ?? "GET"
+      return new Response(JSON.stringify(snapshot), { status: 200 })
+    })
+
+    expect(requestedPath).toBe("/api/chats/chat%20one/refresh")
+    expect(requestedMethod).toBe("POST")
+    expect(result?.runtime.chatId).toBe(snapshot.runtime.chatId)
+  })
+
+  test("surfaces a failed local snapshot response to its caller", async () => {
+    await expect(fetchFreshChatTranscript("chat-1", async () => new Response("offline", { status: 503 })))
+      .rejects.toThrow("503")
   })
 })
 

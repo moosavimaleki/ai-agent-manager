@@ -58,5 +58,9 @@ export default defineConfig({
   build: {
     outDir: "dist/client",
     emptyOutDir: true,
+    // The startup-budget check consumes this graph in CI and during local
+    // installs. Without a manifest, regressions can silently pull a heavy
+    // feature back into the authenticated startup path.
+    manifest: true,
   },
 })

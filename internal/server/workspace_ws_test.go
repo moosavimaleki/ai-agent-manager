@@ -2,10 +2,13 @@ package server
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"abolqasem/internal/state"
 	"abolqasem/internal/workspace/events"
@@ -49,6 +52,54 @@ func TestWorkspaceNativeHistoryCacheUsesStatAndDoesNotExposeCachedPayload(t *tes
 	}
 }
 
+func TestWorkspaceChatRefreshEndpointInvalidatesNativeTranscriptCache(t *testing.T) {
+	withWorkspaceComposerStore(t)
+
+	nativePath := filepath.Join(t.TempDir(), "rollout.jsonl")
+	if err := os.WriteFile(nativePath, []byte("native transcript"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	project, err := workspaceOpenProject(t.TempDir(), "Project")
+	if err != nil {
+		t.Fatalf("workspaceOpenProject returned error: %v", err)
+	}
+	store := &workspaceEventStore{store: workspaceStore()}
+	chat, err := store.CreateChat(project.ID)
+	if err != nil {
+		t.Fatalf("CreateChat returned error: %v", err)
+	}
+	if err := store.SetChatProvider(chat.ID, "codex"); err != nil {
+		t.Fatalf("SetChatProvider returned error: %v", err)
+	}
+	if err := appendWorkspaceStoreEvent(workspaceStore(), events.StreamChats, events.TypeChatRuntimeSet, time.Now().UnixMilli(), map[string]any{
+		"chatId":               chat.ID,
+		"nativeSessionId":      "native-session",
+		"nativeTranscriptPath": nativePath,
+	}); err != nil {
+		t.Fatalf("append runtime metadata: %v", err)
+	}
+
+	meta, ok, err := workspaceNativeTranscriptMetaForChat(chat.ID)
+	if err != nil || !ok {
+		t.Fatalf("expected transcript metadata, ok=%v err=%v", ok, err)
+	}
+	key, modifiedAt, size, cacheable := workspaceNativeHistoryCacheFingerprint(meta, 20, "")
+	if !cacheable {
+		t.Fatal("expected native transcript to be cacheable")
+	}
+	workspaceNativeHistoryCacheStore(key, modifiedAt, size, map[string]any{"messages": []readmodels.TranscriptEntry{}})
+
+	request := httptest.NewRequest(http.MethodPost, "/api/chats/"+chat.ID+"/refresh", nil)
+	response := httptest.NewRecorder()
+	handleAPIChatRefresh(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected refresh endpoint to return 200, got %d: %s", response.Code, response.Body.String())
+	}
+	if _, ok := workspaceNativeHistoryCacheLookup(key, modifiedAt, size); ok {
+		t.Fatal("expected an explicit chat refresh to invalidate cached transcript")
+	}
+}
+
 func TestWorkspaceCommandRoutingHandlesSystemPing(t *testing.T) {
 	conn := newTestWorkspaceConnection(nil)
 
@@ -65,6 +116,59 @@ func TestWorkspaceCommandRoutingHandlesSystemPing(t *testing.T) {
 	result, ok := response.Result.(map[string]any)
 	if !ok || result["ok"] != true {
 		t.Fatalf("unexpected ping result: %#v", response.Result)
+	}
+}
+
+func TestWorkspaceCommandReceiptCacheReturnsTheFirstDeliveryACK(t *testing.T) {
+	cache := newWorkspaceCommandReceiptCache(2)
+	want := protocol.AckEnvelope("send-1", map[string]any{"chatId": "chat-1"})
+	calls := 0
+	first := cache.Do("send-1", func() protocol.ServerEnvelope {
+		calls++
+		return want
+	})
+	second := cache.Do("send-1", func() protocol.ServerEnvelope {
+		calls++
+		return protocol.ErrorEnvelope("send-1", "duplicate delivery")
+	})
+
+	if calls != 1 {
+		t.Fatalf("expected one delivery, got %d", calls)
+	}
+	if first.Type != protocol.EnvelopeAck || second.Type != protocol.EnvelopeAck || second.ID != "send-1" {
+		t.Fatalf("expected cached delivery ACK, got first=%#v second=%#v", first, second)
+	}
+	result, ok := second.Result.(map[string]any)
+	if !ok || result["chatId"] != "chat-1" {
+		t.Fatalf("unexpected cached result: %#v", second.Result)
+	}
+}
+
+func TestWorkspaceCommandReceiptCacheSerializesConcurrentReplay(t *testing.T) {
+	cache := newWorkspaceCommandReceiptCache(2)
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	results := make(chan protocol.ServerEnvelope, 2)
+	deliver := func() protocol.ServerEnvelope {
+		entered <- struct{}{}
+		<-release
+		return protocol.AckEnvelope("send-1", map[string]any{"ok": true})
+	}
+
+	go func() { results <- cache.Do("send-1", deliver) }()
+	go func() { results <- cache.Do("send-1", deliver) }()
+	<-entered
+	select {
+	case <-entered:
+		close(release)
+		t.Fatal("duplicate replay executed while the first delivery was in flight")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	for range 2 {
+		if response := <-results; response.Type != protocol.EnvelopeAck {
+			t.Fatalf("unexpected replay response: %#v", response)
+		}
 	}
 }
 

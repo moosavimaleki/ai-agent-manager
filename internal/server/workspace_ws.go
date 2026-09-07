@@ -22,6 +22,12 @@ var workspaceWSUpgrader = websocket.Upgrader{
 
 var workspaceTerminals = newWorkspaceTerminalHub()
 
+// A browser can lose a local WebSocket after the command has been accepted
+// but before the ACK is read. Retrying chat.send with the same envelope ID is
+// therefore required for reliable delivery; keep the successful response long
+// enough to return that exact ACK without starting a second Codex turn.
+var workspaceRetryableCommandReceipts = newWorkspaceCommandReceiptCache(512)
+
 const keybindingsSubscription = "__keybindings__"
 
 func workspaceWSOriginAllowed(r *http.Request) bool {
@@ -68,6 +74,65 @@ type workspaceConnection struct {
 type workspaceSubscription struct {
 	key   string
 	topic protocol.SubscriptionTopic
+}
+
+type workspaceCommandReceiptCache struct {
+	mu      sync.Mutex
+	limit   int
+	entries map[string]*workspaceCommandReceipt
+	order   []string
+}
+
+type workspaceCommandReceipt struct {
+	done     chan struct{}
+	response protocol.ServerEnvelope
+}
+
+func newWorkspaceCommandReceiptCache(limit int) *workspaceCommandReceiptCache {
+	return &workspaceCommandReceiptCache{
+		limit:   limit,
+		entries: map[string]*workspaceCommandReceipt{},
+	}
+}
+
+// Do serializes duplicate delivery commands with the same browser envelope
+// ID. A reconnect can replay while the first handler is still waiting for the
+// provider; without the in-flight receipt both handlers could submit the same
+// prompt independently.
+func (c *workspaceCommandReceiptCache) Do(commandID string, fn func() protocol.ServerEnvelope) protocol.ServerEnvelope {
+	if commandID == "" || c.limit <= 0 {
+		return fn()
+	}
+	c.mu.Lock()
+	if existing, ok := c.entries[commandID]; ok {
+		done := existing.done
+		c.mu.Unlock()
+		<-done
+		return existing.response
+	}
+	receipt := &workspaceCommandReceipt{done: make(chan struct{})}
+	c.entries[commandID] = receipt
+	c.mu.Unlock()
+
+	response := fn()
+
+	c.mu.Lock()
+	receipt.response = response
+	close(receipt.done)
+	if response.Type == protocol.EnvelopeAck {
+		c.order = append(c.order, commandID)
+		for len(c.order) > c.limit {
+			oldest := c.order[0]
+			c.order = c.order[1:]
+			delete(c.entries, oldest)
+		}
+	} else {
+		// Validation/provider failures may become recoverable later. Wake current
+		// waiters with this response, but allow a future explicit retry to run.
+		delete(c.entries, commandID)
+	}
+	c.mu.Unlock()
+	return response
 }
 
 func handleWorkspaceWS(w http.ResponseWriter, r *http.Request) {
@@ -169,6 +234,12 @@ func (c *workspaceConnection) handleCommand(envelope protocol.ClientEnvelope) *p
 	commandType, err := protocol.CommandType(envelope.Command)
 	if err != nil {
 		response := protocol.ErrorEnvelope(envelope.ID, err.Error())
+		return &response
+	}
+	if commandType == protocol.CommandChatSend {
+		response := workspaceRetryableCommandReceipts.Do(envelope.ID, func() protocol.ServerEnvelope {
+			return c.handleChatSendCommand(envelope)
+		})
 		return &response
 	}
 
@@ -513,6 +584,14 @@ func (c *workspaceConnection) handleCommand(envelope protocol.ClientEnvelope) *p
 		workspaceConnections.broadcast(chatID)
 		response := protocol.AckEnvelope(envelope.ID, workspaceAck())
 		return &response
+	case protocol.CommandChatReorderPinned:
+		if err := workspaceReorderPinnedChats(envelope.Command); err != nil {
+			response := protocol.ErrorEnvelope(envelope.ID, err.Error())
+			return &response
+		}
+		workspaceConnections.broadcast("")
+		response := protocol.AckEnvelope(envelope.ID, workspaceAck())
+		return &response
 	case protocol.CommandChatDelete:
 		chatID, err := workspaceDeleteChat(envelope.Command)
 		if err != nil {
@@ -525,43 +604,19 @@ func (c *workspaceConnection) handleCommand(envelope protocol.ClientEnvelope) *p
 	case protocol.CommandChatSetDraftProtection:
 		response := protocol.AckEnvelope(envelope.ID, workspaceAck())
 		return &response
-	case protocol.CommandChatSend:
-		command, err := decodeSendCommand(envelope.Command)
-		if err != nil {
-			response := protocol.ErrorEnvelope(envelope.ID, err.Error())
-			return &response
-		}
-		if _, ok := workspaceLegacySessionByChatID(command.ChatID); ok && !workspaceStoredChatExists(command.ChatID) {
-			chatID, err := workspaceMaterializeLegacyChat(command.ChatID)
-			if err != nil {
-				response := protocol.ErrorEnvelope(envelope.ID, err.Error())
-				return &response
-			}
-			command.ChatID = chatID
-		}
-		if err := workspaceEnsureCodexChatWritable(command.ChatID); err != nil {
-			response := protocol.ErrorEnvelope(envelope.ID, err.Error())
-			return &response
-		}
-		result, err := workspaceAgentCoordinator().Send(context.Background(), command)
-		if err != nil {
-			response := protocol.ErrorEnvelope(envelope.ID, err.Error())
-			return &response
-		}
-		response := protocol.AckEnvelope(envelope.ID, result)
-		return &response
 	case protocol.CommandMessageEnqueue:
-		command, err := decodeQueueCommand(envelope.Command)
-		if err != nil {
-			response := protocol.ErrorEnvelope(envelope.ID, err.Error())
-			return &response
-		}
-		queuedID, err := workspaceAgentCoordinator().Enqueue(command)
-		if err != nil {
-			response := protocol.ErrorEnvelope(envelope.ID, err.Error())
-			return &response
-		}
-		response := protocol.AckEnvelope(envelope.ID, map[string]any{"queuedMessageId": queuedID})
+		response := workspaceRetryableCommandReceipts.Do(envelope.ID, func() protocol.ServerEnvelope {
+			command, err := decodeQueueCommand(envelope.Command)
+			if err != nil {
+				return protocol.ErrorEnvelope(envelope.ID, err.Error())
+			}
+			command.RequestID = envelope.ID
+			queuedID, err := workspaceAgentCoordinator().Enqueue(command)
+			if err != nil {
+				return protocol.ErrorEnvelope(envelope.ID, err.Error())
+			}
+			return protocol.AckEnvelope(envelope.ID, map[string]any{"queuedMessageId": queuedID})
+		})
 		return &response
 	case protocol.CommandMessageDequeue:
 		chatID, queuedID, err := decodeQueuedMessageCommand(envelope.Command)
@@ -588,28 +643,28 @@ func (c *workspaceConnection) handleCommand(envelope protocol.ClientEnvelope) *p
 		response := protocol.AckEnvelope(envelope.ID, map[string]any{"ok": true})
 		return &response
 	case protocol.CommandMessageSteer:
-		chatID, queuedID, err := decodeQueuedMessageCommand(envelope.Command)
-		if err != nil {
-			response := protocol.ErrorEnvelope(envelope.ID, err.Error())
-			return &response
-		}
-		if err := workspaceAgentCoordinator().SteerQueued(context.Background(), chatID, queuedID); err != nil {
-			response := protocol.ErrorEnvelope(envelope.ID, err.Error())
-			return &response
-		}
-		response := protocol.AckEnvelope(envelope.ID, map[string]any{"ok": true})
+		response := workspaceRetryableCommandReceipts.Do(envelope.ID, func() protocol.ServerEnvelope {
+			chatID, queuedID, err := decodeQueuedMessageCommand(envelope.Command)
+			if err != nil {
+				return protocol.ErrorEnvelope(envelope.ID, err.Error())
+			}
+			if err := workspaceAgentCoordinator().SteerQueued(context.Background(), chatID, queuedID); err != nil {
+				return protocol.ErrorEnvelope(envelope.ID, err.Error())
+			}
+			return protocol.AckEnvelope(envelope.ID, map[string]any{"ok": true})
+		})
 		return &response
 	case protocol.CommandMessageInterrupt:
-		chatID, queuedID, err := decodeQueuedMessageCommand(envelope.Command)
-		if err != nil {
-			response := protocol.ErrorEnvelope(envelope.ID, err.Error())
-			return &response
-		}
-		if err := workspaceAgentCoordinator().InterruptQueued(context.Background(), chatID, queuedID); err != nil {
-			response := protocol.ErrorEnvelope(envelope.ID, err.Error())
-			return &response
-		}
-		response := protocol.AckEnvelope(envelope.ID, map[string]any{"ok": true})
+		response := workspaceRetryableCommandReceipts.Do(envelope.ID, func() protocol.ServerEnvelope {
+			chatID, queuedID, err := decodeQueuedMessageCommand(envelope.Command)
+			if err != nil {
+				return protocol.ErrorEnvelope(envelope.ID, err.Error())
+			}
+			if err := workspaceAgentCoordinator().InterruptQueued(context.Background(), chatID, queuedID); err != nil {
+				return protocol.ErrorEnvelope(envelope.ID, err.Error())
+			}
+			return protocol.AckEnvelope(envelope.ID, map[string]any{"ok": true})
+		})
 		return &response
 	case protocol.CommandChatCancel:
 		chatID, err := decodeChatID(envelope.Command)
@@ -649,10 +704,13 @@ func (c *workspaceConnection) handleCommand(envelope protocol.ClientEnvelope) *p
 		response := protocol.AckEnvelope(envelope.ID, map[string]any{"ok": true})
 		return &response
 	case protocol.CommandChatRefresh:
-		chatID, err := decodeChatID(envelope.Command)
+		chatID, forceTranscriptRefresh, err := decodeChatRefreshCommand(envelope.Command)
 		if err != nil {
 			response := protocol.ErrorEnvelope(envelope.ID, err.Error())
 			return &response
+		}
+		if forceTranscriptRefresh {
+			workspaceInvalidateNativeHistoryCacheForChat(chatID)
 		}
 		RecoverQueuedMessageForChat(chatID)
 		workspaceConnections.broadcast(chatID)
@@ -1003,6 +1061,29 @@ func (c *workspaceConnection) handleCommand(envelope protocol.ClientEnvelope) *p
 		response := protocol.ErrorEnvelope(envelope.ID, "This browser tab and the local server are out of sync (unknown command: "+commandType+"). Reload the page; if it persists, restart Abolqasem.")
 		return &response
 	}
+}
+
+func (c *workspaceConnection) handleChatSendCommand(envelope protocol.ClientEnvelope) protocol.ServerEnvelope {
+	command, err := decodeSendCommand(envelope.Command)
+	if err != nil {
+		return protocol.ErrorEnvelope(envelope.ID, err.Error())
+	}
+	if _, ok := workspaceLegacySessionByChatID(command.ChatID); ok && !workspaceStoredChatExists(command.ChatID) {
+		chatID, err := workspaceMaterializeLegacyChat(command.ChatID)
+		if err != nil {
+			return protocol.ErrorEnvelope(envelope.ID, err.Error())
+		}
+		command.ChatID = chatID
+	}
+	command.RequestID = envelope.ID
+	if err := workspaceEnsureCodexChatWritable(command.ChatID); err != nil {
+		return protocol.ErrorEnvelope(envelope.ID, err.Error())
+	}
+	result, err := workspaceAgentCoordinator().Send(context.Background(), command)
+	if err != nil {
+		return protocol.ErrorEnvelope(envelope.ID, err.Error())
+	}
+	return protocol.AckEnvelope(envelope.ID, result)
 }
 
 func (c *workspaceConnection) write(envelope protocol.ServerEnvelope) error {

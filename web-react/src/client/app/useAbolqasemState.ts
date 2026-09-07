@@ -507,8 +507,12 @@ export function reconcileOptimisticUserPrompts(
   })
 }
 
-const INITIAL_CHAT_RECENT_LIMIT = 200
-const CHAT_HISTORY_PAGE_SIZE = 500
+// Startup must stay bounded as a conversation grows. Rendering a whole
+// transcript is CPU-bound (message hydration, markdown and tool cards), so a
+// large fixed tail makes the app slower every day even when the WebSocket is
+// fast. Older messages remain available through the existing history control.
+export const INITIAL_CHAT_RECENT_LIMIT = 50
+export const CHAT_HISTORY_PAGE_SIZE = 100
 
 type RuntimeChatSnapshot = Omit<ChatSnapshot, "queuedMessages" | "messages" | "history" | "availableProviders"> & {
   queuedMessages?: ChatSnapshot["queuedMessages"] | null
@@ -569,6 +573,23 @@ export function normalizeChatSnapshot(snapshot: ChatSnapshot | null): ChatSnapsh
     history,
     availableProviders,
   }
+}
+
+export async function fetchFreshChatTranscript(
+  chatId: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<ChatSnapshot | null> {
+  const response = await fetchImpl(
+    `/api/chats/${encodeURIComponent(chatId)}/refresh`,
+    {
+      method: "POST",
+      headers: { Accept: "application/json" },
+    },
+  )
+  if (!response.ok) {
+    throw new Error(`Chat transcript refresh failed with status ${response.status}`)
+  }
+  return normalizeChatSnapshot((await response.json()) as ChatSnapshot | null)
 }
 
 export function shouldEnqueueUserPrompt(activeChatId: string | null, isProcessing: boolean) {
@@ -964,6 +985,7 @@ export interface AbolqasemState {
   closeAddProjectModal: () => void
   loadOlderHistory: () => Promise<void>
   loadHistoryAround: (targetCursor: string, limit?: number) => Promise<boolean>
+  refreshChatTranscript: () => Promise<ChatSnapshot | null>
   handleCreateChat: (projectId: string) => Promise<void>
   handleForkChat: (chat: SidebarChatRow) => Promise<void>
   handleConvertChat: (chat: SidebarChatRow, provider: AgentProvider) => Promise<void>
@@ -988,6 +1010,7 @@ export interface AbolqasemState {
   handleRenameProject: (projectId: string, sidebarTitle: string | undefined, realTitle: string) => Promise<void>
   handleArchiveChat: (chat: SidebarChatRow) => Promise<void>
   handlePinChat: (chat: SidebarChatRow) => Promise<void>
+  handleReorderPinnedChats: (chatIds: string[]) => Promise<void>
   handleOpenArchivedChat: (chatId: string) => Promise<void>
   handleDeleteChat: (chat: SidebarChatRow) => Promise<void>
   handleHideProject: (projectId: string) => Promise<void>
@@ -2413,6 +2436,16 @@ export function useAbolqasemState(activeChatId: string | null): AbolqasemState {
     }
   }, [socket])
 
+  const handleReorderPinnedChats = useCallback(async (chatIds: string[]) => {
+    try {
+      setCommandError(null)
+      await socket.command({ type: "chat.reorderPinned", chatIds })
+    } catch (error) {
+      setCommandError(error instanceof Error ? error.message : String(error))
+      throw error
+    }
+  }, [socket])
+
   const handleOpenArchivedChat = useCallback(async (chatId: string) => {
     try {
       setPendingChatId(chatId)
@@ -2616,6 +2649,22 @@ export function useAbolqasemState(activeChatId: string | null): AbolqasemState {
     }
   }, [activeChatId, socket])
 
+  const refreshChatTranscript = useCallback(async () => {
+    if (!activeChatId) return null
+    const snapshot = await fetchFreshChatTranscript(activeChatId)
+    if (!snapshot || snapshot.runtime.chatId !== activeChatId) {
+      throw new Error("The refreshed transcript did not match the active chat")
+    }
+    setChatSnapshot((current) =>
+      sameChatSnapshotCore(current, snapshot) ? current : snapshot,
+    )
+    setHistoryCursor(snapshot.history.olderCursor ?? null)
+    setHasOlderHistory(snapshot.history.hasOlder ?? false)
+    setChatReady(true)
+    setCommandError(null)
+    return snapshot
+  }, [activeChatId])
+
   const handleExitPlanMode = useCallback(async (toolUseId: string, confirmed: boolean, clearContext?: boolean, message?: string) => {
     if (!activeChatId) return
     try {
@@ -2709,6 +2758,7 @@ export function useAbolqasemState(activeChatId: string | null): AbolqasemState {
     handleRenameProject,
     handleArchiveChat,
     handlePinChat,
+    handleReorderPinnedChats,
     handleOpenArchivedChat,
     handleDeleteChat,
     handleHideProject,
@@ -2720,6 +2770,7 @@ export function useAbolqasemState(activeChatId: string | null): AbolqasemState {
     handleCompose,
     handleAskUserQuestion,
     handleApprovalRequest,
+    refreshChatTranscript,
     handleExitPlanMode,
     handleRestoreCheckpoint,
   }

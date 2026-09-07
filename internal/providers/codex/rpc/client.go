@@ -19,9 +19,10 @@ type Client struct {
 	transport Transport
 	nextID    atomic.Int64
 
-	mu      sync.Mutex
-	pending map[string]chan responseEnvelope
-	stderr  strings.Builder
+	mu       sync.Mutex
+	pending  map[string]chan responseEnvelope
+	stderr   strings.Builder
+	closeErr error
 
 	notifications chan Notification
 }
@@ -72,6 +73,11 @@ func (c *Client) Call(ctx context.Context, method string, params any, result any
 	responseCh := make(chan responseEnvelope, 1)
 
 	c.mu.Lock()
+	if c.closeErr != nil {
+		err := c.closeErr
+		c.mu.Unlock()
+		return err
+	}
 	c.pending[id] = responseCh
 	c.mu.Unlock()
 
@@ -101,6 +107,29 @@ func (c *Client) Call(ctx context.Context, method string, params any, result any
 			return nil
 		}
 		return json.Unmarshal(response.Result, result)
+	}
+}
+
+// Close fails every JSON-RPC call that is waiting for a response. The stdio
+// transport has no response once app-server exits; leaving those calls pending
+// would strand a chat in "starting" forever.
+func (c *Client) Close(err error) {
+	if err == nil {
+		err = errors.New("codex app-server stopped")
+	}
+	c.mu.Lock()
+	if c.closeErr != nil {
+		c.mu.Unlock()
+		return
+	}
+	c.closeErr = err
+	pending := c.pending
+	c.pending = map[string]chan responseEnvelope{}
+	c.mu.Unlock()
+
+	responseErr := &ResponseError{Message: err.Error()}
+	for _, responseCh := range pending {
+		responseCh <- responseEnvelope{Error: responseErr}
 	}
 }
 

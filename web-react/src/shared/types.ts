@@ -518,6 +518,7 @@ export interface SidebarChatRow {
   readOnly?: boolean;
   legacySessionKey?: string;
   pinned?: boolean;
+  pinnedOrder?: number;
 }
 
 export interface SidebarProjectGroup {

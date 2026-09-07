@@ -101,6 +101,36 @@ func TestAddRejectsASecondNameForTheSameIdentity(t *testing.T) {
 	}
 }
 
+func TestMarkVerificationPendingPreservesLastKnownQuota(t *testing.T) {
+	repo := Repository{Paths: storage.Paths{Home: t.TempDir()}}
+	ctx := context.Background()
+	if err := repo.Add(ctx, "alpha", authFixture("one"), false); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	previous := &limits.Snapshot{
+		Account:   "alpha",
+		FetchedAt: now.Add(-time.Minute),
+		Limits: []limits.Limit{{
+			ID:      "codex",
+			Windows: []limits.Window{{Label: "weekly", RemainingPercent: 66}},
+		}},
+	}
+	if err := repo.RecordCheckStatus(ctx, "alpha", StateReady, "", now.Add(-time.Minute), previous); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.MarkVerificationPending(ctx, "alpha", now); err != nil {
+		t.Fatal(err)
+	}
+	status, err := repo.Status("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.State != StateStale || status.RateLimits == nil || len(status.RateLimits.Limits) != 1 || status.RateLimits.Limits[0].Windows[0].RemainingPercent != 66 {
+		t.Fatalf("activation must retain the previous quota while checking: %#v", status)
+	}
+}
+
 func TestRenameMovesStatusAndHistoryInOneManagerTransaction(t *testing.T) {
 	repo := Repository{Paths: storage.Paths{Home: t.TempDir()}}
 	ctx := context.Background()

@@ -10,10 +10,19 @@ import (
 
 var accountSwitchKey = []byte("oai/apps/accountSwitchSessions")
 
-// DiscoverSwitchAccounts reads LevelDB files as immutable byte streams. It
-// extracts only email addresses from the account-switcher value and retains no
-// bearer token or session material.
-func DiscoverSwitchAccounts(profile Profile) ([]string, error) {
+// SwitchAccount is the safe, local record retained by ChatGPT's account
+// switcher. It contains identity metadata only; tokens and cookies never leave
+// the Chrome profile.
+type SwitchAccount struct {
+	Email        string
+	LastLoggedIn int64
+}
+
+// DiscoverSwitchAccountActivity reads LevelDB files as immutable byte streams.
+// It preserves the last selected account so callers can retain the account ↔
+// Chrome-profile association even when the current ChatGPT cookie is expired
+// or the sign-in probe fails.
+func DiscoverSwitchAccountActivity(profile Profile) ([]SwitchAccount, error) {
 	if profile.Path == "" {
 		return nil, ErrUnsafeCookiePath
 	}
@@ -42,18 +51,32 @@ func DiscoverSwitchAccounts(profile Profile) ([]string, error) {
 				}
 				offset = index + len(accountSwitchKey)
 				candidate := parseSwitchAccounts(data[offset:])
-				if candidate.latest > best.latest || (candidate.latest == best.latest && len(candidate.emails) > len(best.emails)) {
+				if candidate.latest > best.latest || (candidate.latest == best.latest && len(candidate.accounts) > len(best.accounts)) {
 					best = candidate
 				}
 			}
 		}
 	}
-	return best.emails, nil
+	return best.accounts, nil
+}
+
+// DiscoverSwitchAccounts is retained for callers that only need emails.
+func DiscoverSwitchAccounts(profile Profile) ([]string, error) {
+	accounts, err := DiscoverSwitchAccountActivity(profile)
+	if err != nil {
+		return nil, err
+	}
+	emails := make([]string, 0, len(accounts))
+	for _, account := range accounts {
+		emails = append(emails, account.Email)
+	}
+	sort.Strings(emails)
+	return emails, nil
 }
 
 type accountCandidate struct {
-	latest int64
-	emails []string
+	latest   int64
+	accounts []SwitchAccount
 }
 
 func parseSwitchAccounts(data []byte) accountCandidate {
@@ -69,22 +92,29 @@ func parseSwitchAccounts(data []byte) accountCandidate {
 	if decoder.Decode(&values) != nil {
 		return accountCandidate{}
 	}
-	seen := make(map[string]struct{})
+	seen := make(map[string]int64)
 	result := accountCandidate{}
 	for _, value := range values {
 		email := strings.ToLower(strings.TrimSpace(value.Email))
 		if email == "" {
 			continue
 		}
-		seen[email] = struct{}{}
+		if previous, ok := seen[email]; !ok || value.LastLoggedIn > previous {
+			seen[email] = value.LastLoggedIn
+		}
 		if value.LastLoggedIn > result.latest {
 			result.latest = value.LastLoggedIn
 		}
 	}
-	for email := range seen {
-		result.emails = append(result.emails, email)
+	for email, lastLoggedIn := range seen {
+		result.accounts = append(result.accounts, SwitchAccount{Email: email, LastLoggedIn: lastLoggedIn})
 	}
-	sort.Strings(result.emails)
+	sort.Slice(result.accounts, func(i, j int) bool {
+		if result.accounts[i].LastLoggedIn != result.accounts[j].LastLoggedIn {
+			return result.accounts[i].LastLoggedIn > result.accounts[j].LastLoggedIn
+		}
+		return result.accounts[i].Email < result.accounts[j].Email
+	})
 	return result
 }
 

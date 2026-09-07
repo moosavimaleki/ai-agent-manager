@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -140,18 +141,37 @@ func handleAPICodexManagerBrowserProfileAction(w http.ResponseWriter, r *http.Re
 	writeJSON(w, map[string]bool{"opened": true})
 }
 
-var codexManagerOpenChromeProfile = openCodexManagerChromeProfile
+var (
+	codexManagerOpenChromeProfile   = openCodexManagerChromeProfile
+	codexManagerOpenChromeProfileAt = openCodexManagerChromeProfileAt
+	codexManagerFindChromeProfile   = codexManagerBrowserProfile
+)
 
 func openCodexManagerChromeProfile(profile browser.Profile) error {
+	return openCodexManagerChromeProfileAt(profile, "")
+}
+
+// openCodexManagerChromeProfileAt opens an official Codex sign-in page in the
+// exact local Chrome profile selected for an account. The URL is validated at
+// the API boundary so a browser-profile association can never become an
+// arbitrary command argument.
+func openCodexManagerChromeProfileAt(profile browser.Profile, target string) error {
 	argument := "--profile-directory=" + profile.Directory
+	arguments := []string{argument}
+	if target != "" {
+		arguments = append(arguments, target)
+	}
 	var commands [][]string
 	switch runtime.GOOS {
 	case "darwin":
-		commands = [][]string{{"open", "-a", "Google Chrome", "--args", argument}}
+		commands = [][]string{append([]string{"open", "-a", "Google Chrome", "--args"}, arguments...)}
 	case "windows":
-		commands = [][]string{{"cmd", "/c", "start", "", "chrome", argument}}
+		commands = [][]string{append([]string{"cmd", "/c", "start", "", "chrome"}, arguments...)}
 	default:
-		commands = [][]string{{"google-chrome", argument}, {"google-chrome-stable", argument}, {"chromium", argument}, {"chromium-browser", argument}}
+		commands = [][]string{{"google-chrome"}, {"google-chrome-stable"}, {"chromium"}, {"chromium-browser"}}
+		for index := range commands {
+			commands[index] = append(commands[index], arguments...)
+		}
 	}
 	var lastErr error
 	for _, command := range commands {
@@ -169,6 +189,18 @@ func openCodexManagerChromeProfile(profile browser.Profile) error {
 		return fmt.Errorf("Chrome executable was not found")
 	}
 	return lastErr
+}
+
+func codexManagerOfficialSignInURL(raw string) (string, error) {
+	value, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || value.Scheme != "https" || value.Hostname() == "" {
+		return "", fmt.Errorf("invalid Codex sign-in URL")
+	}
+	host := strings.ToLower(value.Hostname())
+	if host != "auth.openai.com" && host != "chatgpt.com" && host != "www.chatgpt.com" && host != "chat.openai.com" {
+		return "", fmt.Errorf("unexpected Codex sign-in host")
+	}
+	return value.String(), nil
 }
 
 func handleAPICodexManagerMigration(w http.ResponseWriter, r *http.Request) {
@@ -262,13 +294,48 @@ func handleAPICodexManagerBrowserScan(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"profiles": cached.Profiles, "scannedAt": cached.ScannedAt})
 }
 
-func codexManagerScanChromeProfile(ctx context.Context, profile browser.Profile, managed map[string]account.Account, proxyURL string) map[string]any {
-	savedAccounts, _ := browser.DiscoverSwitchAccounts(profile)
+func codexManagerScanChromeProfile(ctx context.Context, profile browser.Profile, managed map[string]account.Account, historical []account.Account, proxyURL string) map[string]any {
+	switchAccounts, _ := browser.DiscoverSwitchAccountActivity(profile)
+	savedAccounts := make([]string, 0, len(switchAccounts))
+	associatedAccounts := make(map[string]string)
+	lastActiveEmail := ""
+	lastManagedAccount := ""
+	for _, switchAccount := range switchAccounts {
+		email := strings.ToLower(strings.TrimSpace(switchAccount.Email))
+		if email == "" {
+			continue
+		}
+		savedAccounts = append(savedAccounts, email)
+		if lastActiveEmail == "" {
+			lastActiveEmail = email
+		}
+		if item, found := managed[email]; found {
+			associatedAccounts[email] = item.Name
+			if lastManagedAccount == "" {
+				lastManagedAccount = item.Name
+			}
+		}
+	}
+	for _, item := range historical {
+		email := strings.ToLower(strings.TrimSpace(item.Email))
+		if email != "" {
+			associatedAccounts[email] = item.Name
+		}
+		if lastActiveEmail == "" && item.ChromeProfile != nil {
+			lastActiveEmail = item.ChromeProfile.LastActiveEmail
+		}
+		if lastManagedAccount == "" {
+			lastManagedAccount = item.Name
+		}
+	}
 	result := map[string]any{
-		"id":            profile.ID,
-		"name":          profile.Name,
-		"savedAccounts": savedAccounts,
-		"outcome":       "signed_out",
+		"id":                 profile.ID,
+		"name":               profile.Name,
+		"savedAccounts":      savedAccounts,
+		"accounts":           associatedAccounts,
+		"lastActiveEmail":    lastActiveEmail,
+		"lastManagedAccount": lastManagedAccount,
+		"outcome":            "signed_out",
 	}
 	cookies, err := browser.LoadChatGPTCookies(ctx, profile, nil)
 	if err != nil {
@@ -303,6 +370,10 @@ func codexManagerScanChromeProfile(ctx context.Context, profile browser.Profile,
 	if item, found := managed[strings.ToLower(strings.TrimSpace(email))]; found {
 		result["managedAccount"] = item.Name
 		result["managedPlan"] = item.Plan
+		associatedAccounts[strings.ToLower(strings.TrimSpace(email))] = item.Name
+		if result["lastManagedAccount"] == "" {
+			result["lastManagedAccount"] = item.Name
+		}
 	}
 	return result
 }
@@ -377,6 +448,35 @@ func handleAPICodexManagerAccountAction(w http.ResponseWriter, r *http.Request, 
 	name, action := parts[0], parts[1]
 	repository := account.Repository{Paths: codexManagerPaths()}
 	switch {
+	case r.Method == http.MethodPost && action == "chrome-login":
+		var payload struct {
+			VerificationURL string `json:"verificationUrl"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&payload); err != nil {
+			http.Error(w, "Invalid Chrome sign-in JSON", http.StatusBadRequest)
+			return
+		}
+		verificationURL, err := codexManagerOfficialSignInURL(payload.VerificationURL)
+		if err != nil {
+			http.Error(w, "Invalid Codex sign-in URL", http.StatusBadRequest)
+			return
+		}
+		status, err := repository.Status(name)
+		if err != nil || status.ChromeProfile == nil || strings.TrimSpace(status.ChromeProfile.ID) == "" {
+			http.Error(w, "No Chrome profile is associated with this account yet", http.StatusNotFound)
+			return
+		}
+		profile, ok := codexManagerFindChromeProfile(status.ChromeProfile.ID)
+		if !ok {
+			http.Error(w, "The associated Chrome profile is not available on this device", http.StatusNotFound)
+			return
+		}
+		if err := codexManagerOpenChromeProfileAt(profile, verificationURL); err != nil {
+			http.Error(w, "Could not open the associated Chrome profile: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		writeJSON(w, map[string]any{"opened": true, "profileId": profile.ID, "profileName": profile.Name})
+		return
 	case r.Method == http.MethodPost && action == "check":
 		var payload struct {
 			ForceRefresh bool `json:"forceRefresh"`
@@ -637,40 +737,20 @@ func redactCodexManagerAccounts(repository account.Repository) []account.Account
 // contains no token material and lets the UI distinguish a ready account from
 // one that needs a fresh device login after an explicit limit check.
 func codexManagerAccountStatus(paths storage.Paths, name string) (account.State, *time.Time, *time.Time, string, *limits.Snapshot, *account.SessionMonitor, *account.ChromeProfile) {
-	path, err := paths.Status(name)
-	if err != nil {
-		return account.StateReady, nil, nil, "", nil, nil, nil
-	}
-	var status struct {
-		State                  string                  `json:"state"`
-		Message                string                  `json:"message"`
-		CheckedAt              time.Time               `json:"checked_at"`
-		RateLimits             *limits.Snapshot        `json:"rate_limits"`
-		SessionMonitor         *account.SessionMonitor `json:"session_monitor"`
-		SessionMonitorDisabled bool                    `json:"session_monitor_disabled"`
-		ChromeProfile          *account.ChromeProfile  `json:"chrome_profile"`
-	}
-	if err := storage.ReadJSON(path, &status); err != nil {
-		return account.StateReady, nil, nil, "", nil, nil, nil
-	}
-	state := account.State(strings.TrimSpace(status.State))
-	if state != account.StateReady && state != account.StateNeedsLogin && state != account.StateError && state != account.StateStale {
-		state = account.StateReady
-	}
+	status, _ := (account.Repository{Paths: paths}).Status(name)
 	if status.SessionMonitor == nil && status.SessionMonitorDisabled {
 		status.SessionMonitor = &account.SessionMonitor{RevocationDisabled: true}
 	} else if status.SessionMonitor != nil && status.SessionMonitorDisabled {
 		status.SessionMonitor.RevocationDisabled = true
 	}
-	if status.CheckedAt.IsZero() {
-		return state, nil, nil, strings.TrimSpace(status.Message), status.RateLimits, status.SessionMonitor, status.ChromeProfile
+	if status.CheckedAt == nil {
+		return status.State, nil, nil, status.Message, status.RateLimits, status.SessionMonitor, status.ChromeProfile
 	}
-	checkedAt := status.CheckedAt.UTC()
 	var refreshedAt *time.Time
-	if strings.HasPrefix(strings.TrimSpace(status.Message), "refreshed") {
-		refreshedAt = &checkedAt
+	if strings.HasPrefix(status.Message, "refreshed") {
+		refreshedAt = status.CheckedAt
 	}
-	return state, &checkedAt, refreshedAt, strings.TrimSpace(status.Message), status.RateLimits, status.SessionMonitor, status.ChromeProfile
+	return status.State, status.CheckedAt, refreshedAt, status.Message, status.RateLimits, status.SessionMonitor, status.ChromeProfile
 }
 
 func secretsConfigured(name string) bool {

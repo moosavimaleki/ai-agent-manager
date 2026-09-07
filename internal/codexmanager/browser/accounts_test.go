@@ -21,6 +21,10 @@ func TestDiscoverSwitchAccountsAndAssociatesManagedAccounts(t *testing.T) {
 	if err != nil || len(emails) != 2 || emails[0] != "one@example.com" {
 		t.Fatalf("emails=%v err=%v", emails, err)
 	}
+	activity, err := DiscoverSwitchAccountActivity(Profile{Path: profilePath})
+	if err != nil || len(activity) != 2 || activity[0].Email != "two@example.com" || activity[0].LastLoggedIn != 20 {
+		t.Fatalf("activity=%#v err=%v", activity, err)
+	}
 	matched := AssociateManagedAccounts(emails, map[string]string{"first": "ONE@example.com", "other": "none@example.com"})
 	if matched["one@example.com"] != "first" || len(matched) != 1 {
 		t.Fatalf("matched=%v", matched)

@@ -12,10 +12,85 @@ import (
 	"time"
 
 	"abolqasem/internal/codexmanager/account"
+	"abolqasem/internal/codexmanager/browser"
 	"abolqasem/internal/codexmanager/history"
 	"abolqasem/internal/codexmanager/limits"
 	"abolqasem/internal/codexmanager/storage"
 )
+
+func TestCodexManagerOfficialSignInURL(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "official auth host", raw: "https://auth.openai.com/codex/device", want: "https://auth.openai.com/codex/device"},
+		{name: "official ChatGPT host", raw: "https://chatgpt.com/auth/login", want: "https://chatgpt.com/auth/login"},
+		{name: "reject non HTTPS", raw: "http://auth.openai.com/codex/device"},
+		{name: "reject untrusted host", raw: "https://auth.openai.com.evil.example/codex/device"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := codexManagerOfficialSignInURL(test.raw)
+			if test.want == "" {
+				if err == nil {
+					t.Fatalf("expected URL %q to be rejected", test.raw)
+				}
+				return
+			}
+			if err != nil || got != test.want {
+				t.Fatalf("got=%q err=%v want=%q", got, err, test.want)
+			}
+		})
+	}
+}
+
+func TestCodexManagerChromeLoginOpensAssociatedProfileOnly(t *testing.T) {
+	previousDir := codexManagerStateDir
+	previousFind := codexManagerFindChromeProfile
+	previousOpen := codexManagerOpenChromeProfileAt
+	stateDir := t.TempDir()
+	codexManagerStateDir = func() string { return stateDir }
+	codexManagerFindChromeProfile = func(id string) (browser.Profile, bool) {
+		if id != "google-chrome/Profile 4" {
+			return browser.Profile{}, false
+		}
+		return browser.Profile{ID: id, Name: "Managed", Directory: "Profile 4"}, true
+	}
+	var openedProfile browser.Profile
+	var openedURL string
+	codexManagerOpenChromeProfileAt = func(profile browser.Profile, target string) error {
+		openedProfile, openedURL = profile, target
+		return nil
+	}
+	t.Cleanup(func() {
+		codexManagerStateDir = previousDir
+		codexManagerFindChromeProfile = previousFind
+		codexManagerOpenChromeProfileAt = previousOpen
+	})
+
+	repository := account.Repository{Paths: codexManagerPaths()}
+	if err := repository.Add(context.Background(), "personal", map[string]any{"tokens": map[string]any{"refresh_token": "refresh"}}, false); err != nil {
+		t.Fatal(err)
+	}
+	statusPath, err := repository.Paths.Status("personal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.WriteJSON(repository.Paths, statusPath, map[string]any{
+		"state":          "needs_login",
+		"chrome_profile": account.ChromeProfile{ID: "google-chrome/Profile 4", Name: "Managed"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/codex-manager/accounts/personal/chrome-login", bytes.NewBufferString(`{"verificationUrl":"https://auth.openai.com/codex/device"}`))
+	handleAPICodexManagerAccountAction(recorder, request, "personal/chrome-login")
+	if recorder.Code != http.StatusOK || openedProfile.ID != "google-chrome/Profile 4" || openedURL != "https://auth.openai.com/codex/device" {
+		t.Fatalf("code=%d profile=%#v url=%q body=%s", recorder.Code, openedProfile, openedURL, recorder.Body.String())
+	}
+}
 
 func TestCodexManagerAccountAPIRedactsCredentialsAndSupportsCRUD(t *testing.T) {
 	previousDir, previousLiveRoot, previousCheck := codexManagerStateDir, codexManagerLiveAuthRoot, startCodexManagerPostSwitchCheck
@@ -144,6 +219,63 @@ func TestChromeScanKeepsLastProfileAssociationAndMarksChangedSignIn(t *testing.T
 	}
 }
 
+func TestChromeScanAssociatesSavedAccountWhenChatGPTIsSignedOut(t *testing.T) {
+	previousDir, previousLiveRoot := codexManagerStateDir, codexManagerLiveAuthRoot
+	stateDir := t.TempDir()
+	codexManagerStateDir = func() string { return stateDir }
+	codexManagerLiveAuthRoot = t.TempDir
+	t.Cleanup(func() { codexManagerStateDir, codexManagerLiveAuthRoot = previousDir, previousLiveRoot })
+
+	paths := codexManagerPaths()
+	repository := account.Repository{Paths: paths}
+	if err := repository.Add(context.Background(), "work", map[string]any{"email": "work@example.com", "tokens": map[string]any{"refresh_token": "refresh-token"}}, false); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := codexManagerChromeScanSnapshot{
+		ScannedAt: time.Date(2026, 9, 5, 8, 0, 0, 0, time.UTC),
+		Profiles: []map[string]any{{
+			"id": "google-chrome/Profile 3", "name": "Work", "outcome": "signed_out",
+			"accounts":        map[string]string{"work@example.com": "work"},
+			"lastActiveEmail": "work@example.com", "lastManagedAccount": "work",
+		}},
+	}
+	if err := codexManagerStoreChromeProfileAssociations(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	accounts := redactCodexManagerAccounts(repository)
+	if len(accounts) != 1 || accounts[0].ChromeProfile == nil {
+		t.Fatalf("missing Chrome association: %#v", accounts)
+	}
+	profile := accounts[0].ChromeProfile
+	if profile.Name != "Work" || profile.Outcome != "signed_out" || profile.LastActiveEmail != "work@example.com" || profile.LastManagedAccount != "work" || profile.LastSeenAt == nil || !profile.LastSeenAt.Equal(snapshot.ScannedAt) {
+		t.Fatalf("unexpected Chrome association: %#v", profile)
+	}
+}
+
+func TestChromeScanRetainsUnavailableProfileInChromeTable(t *testing.T) {
+	profiles := codexManagerAppendMissingChromeProfiles(nil, []account.Account{{
+		Name:  "archived",
+		Email: "archived@example.com",
+		ChromeProfile: &account.ChromeProfile{
+			ID:                 "google-chrome/Profile 9",
+			Name:               "Archived work",
+			LastActiveEmail:    "archived@example.com",
+			LastManagedAccount: "archived",
+		},
+	}})
+	if len(profiles) != 1 {
+		t.Fatalf("profiles=%#v", profiles)
+	}
+	profile := profiles[0]
+	if profile["outcome"] != "missing" || profile["lastActiveEmail"] != "archived@example.com" || profile["lastManagedAccount"] != "archived" {
+		t.Fatalf("unexpected missing profile: %#v", profile)
+	}
+	linked, _ := profile["accounts"].(map[string]string)
+	if linked["archived@example.com"] != "archived" {
+		t.Fatalf("linked accounts=%#v", linked)
+	}
+}
+
 func TestCodexManagerCheckAPICompletesWithoutAccounts(t *testing.T) {
 	previousDir, previousLiveRoot := codexManagerStateDir, codexManagerLiveAuthRoot
 	stateDir := t.TempDir()
@@ -163,7 +295,7 @@ func TestCodexManagerHistoryAPIBoundsPagesAndBuildsLocalizedSeries(t *testing.T)
 	codexManagerStateDir = func() string { return stateDir }
 	t.Cleanup(func() { codexManagerStateDir = previousDir })
 	store := history.Store{Paths: codexManagerPaths()}
-	start := time.Date(2026, 8, 28, 8, 0, 0, 0, time.UTC)
+	start := time.Now().UTC().Add(-3 * time.Hour).Truncate(time.Hour)
 	for index := 0; index < 4; index++ {
 		snapshot := limits.Snapshot{Account: "personal", FetchedAt: start.Add(time.Duration(index) * time.Hour), Limits: []limits.Limit{{ID: "codex", Windows: []limits.Window{{Label: "weekly", RemainingPercent: float64(90 - index)}}}}}
 		if _, err := store.Append(context.Background(), snapshot); err != nil {

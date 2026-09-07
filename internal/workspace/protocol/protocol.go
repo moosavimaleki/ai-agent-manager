@@ -95,6 +95,7 @@ const (
 	CommandChatArchive                     = "chat.archive"
 	CommandChatUnarchive                   = "chat.unarchive"
 	CommandChatPin                         = "chat.pin"
+	CommandChatReorderPinned               = "chat.reorderPinned"
 	CommandChatDelete                      = "chat.delete"
 	CommandChatSetDraftProtection          = "chat.setDraftProtection"
 	CommandChatMarkRead                    = "chat.markRead"

@@ -184,10 +184,11 @@ export type ClientCommand =
   | { type: "chat.archive"; chatId: string }
   | { type: "chat.unarchive"; chatId: string }
   | { type: "chat.pin"; chatId: string; pinned: boolean }
+  | { type: "chat.reorderPinned"; chatIds: string[] }
   | { type: "chat.delete"; chatId: string }
   | { type: "chat.setDraftProtection"; chatIds: string[] }
   | { type: "chat.markRead"; chatId: string }
-  | { type: "chat.refresh"; chatId: string }
+  | { type: "chat.refresh"; chatId: string; forceTranscriptRefresh?: boolean }
   | { type: "chat.claimCodexSession"; chatId: string }
   | { type: "chat.releaseCodexSession"; chatId: string }
   | {

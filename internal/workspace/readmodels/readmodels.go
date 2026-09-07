@@ -32,6 +32,7 @@ type ChatRecord struct {
 	DeletedAt               int64   `json:"deletedAt,omitempty"`
 	ArchivedAt              int64   `json:"archivedAt,omitempty"`
 	Pinned                  bool    `json:"pinned,omitempty"`
+	PinnedOrder             int64   `json:"pinnedOrder,omitempty"`
 	Unread                  bool    `json:"unread"`
 	Provider                *string `json:"provider"`
 	PlanMode                bool    `json:"planMode"`
@@ -207,6 +208,7 @@ type SidebarChatRow struct {
 	ReadOnly         bool    `json:"readOnly,omitempty"`
 	LegacySessionKey string  `json:"legacySessionKey,omitempty"`
 	Pinned           bool    `json:"pinned,omitempty"`
+	PinnedOrder      int64   `json:"pinnedOrder,omitempty"`
 }
 
 func EmptyState() StoreState {
@@ -345,9 +347,31 @@ func Apply(state StoreState, event events.Event) StoreState {
 		}
 		record := state.ChatsByID[data.ChatID]
 		record.Pinned = data.Pinned
+		if data.Pinned {
+			record.PinnedOrder = event.Timestamp
+		} else {
+			record.PinnedOrder = 0
+		}
 		record.UpdatedAt = event.Timestamp
 		state.ChatsByID[data.ChatID] = record
 		state = touchProjectTimestampForChat(state, record, event.Timestamp)
+	case events.TypeChatPinnedReordered:
+		var data struct {
+			ChatIDs []string `json:"chatIds"`
+		}
+		if event.DecodeData(&data) != nil {
+			return state
+		}
+		for index, chatID := range data.ChatIDs {
+			record, ok := state.ChatsByID[chatID]
+			if !ok || !record.Pinned {
+				continue
+			}
+			// Pin order belongs to the user rather than chat activity, so it
+			// deliberately does not change UpdatedAt or project recency.
+			record.PinnedOrder = event.Timestamp + int64(len(data.ChatIDs)-index)
+			state.ChatsByID[chatID] = record
+		}
 	case events.TypeChatProviderSet:
 		var data struct {
 			ChatID   string `json:"chatId"`
@@ -880,6 +904,7 @@ func sidebarRow(project ProjectRecord, chat ChatRecord, activeStatus AbolqasemSt
 		HasAutomation: false,
 		CanFork:       chat.Provider != nil,
 		Pinned:        chat.Pinned,
+		PinnedOrder:   chat.PinnedOrder,
 	}
 }
 

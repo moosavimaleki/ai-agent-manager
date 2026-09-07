@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -17,6 +18,12 @@ import (
 	"abolqasem/internal/workspace/readmodels"
 	"abolqasem/internal/workspace/transcript"
 )
+
+// A chat snapshot is decoded, hydrated and rendered on the browser main
+// thread. Keep its initial payload bounded even when one conversation has
+// accumulated unusually large tool output. Older entries are fetched only
+// when the user asks for history.
+const workspaceInitialTranscriptMaxBytes = 512 * 1024
 
 var workspaceDataDir = func() string {
 	return filepath.Join(state.GetStateDir(), "data")
@@ -230,8 +237,17 @@ func workspaceNativeTranscriptSnapshot(chat readmodels.ChatRecord, recentLimit i
 			olderCursor = &cursor
 		}
 	}
+	trimmed := workspaceTrimTranscriptSnapshotPayload(messages)
+	trimmed, omitted := workspaceBoundTranscriptSnapshotPayload(trimmed, workspaceInitialTranscriptMaxBytes)
+	if omitted > 0 {
+		hasOlder = true
+		cursor := workspaceTranscriptCursor(messages[omitted-1])
+		if cursor != "" {
+			olderCursor = &cursor
+		}
+	}
 	return readmodels.ChatTranscriptSnapshot{
-		Messages: workspaceTrimTranscriptSnapshotPayload(messages),
+		Messages: trimmed,
 		History: readmodels.ChatHistorySnapshot{
 			HasOlder:    hasOlder,
 			OlderCursor: olderCursor,
@@ -316,22 +332,51 @@ func workspaceChatTranscriptSnapshot(store *eventstore.Store, chatID string, rec
 		return readmodels.ChatTranscriptSnapshot{}, err
 	}
 
-	hasOlder := false
-	var olderCursor *string
+	start := 0
 	if recentLimit > 0 && len(entries) > recentLimit {
-		hasOlder = true
-		cursor := workspaceTranscriptCursor(entries[len(entries)-recentLimit-1])
-		olderCursor = &cursor
-		entries = entries[len(entries)-recentLimit:]
+		start = len(entries) - recentLimit
+	}
+	trimmed := workspaceTrimTranscriptSnapshotPayload(entries[start:])
+	trimmed, omitted := workspaceBoundTranscriptSnapshotPayload(trimmed, workspaceInitialTranscriptMaxBytes)
+	start += omitted
+	hasOlder := start > 0
+	var olderCursor *string
+	if hasOlder {
+		cursor := workspaceTranscriptCursor(entries[start-1])
+		if cursor != "" {
+			olderCursor = &cursor
+		}
 	}
 	return readmodels.ChatTranscriptSnapshot{
-		Messages: workspaceTrimTranscriptSnapshotPayload(entries),
+		Messages: trimmed,
 		History: readmodels.ChatHistorySnapshot{
 			HasOlder:    hasOlder,
 			OlderCursor: olderCursor,
 			RecentLimit: recentLimit,
 		},
 	}, nil
+}
+
+// workspaceBoundTranscriptSnapshotPayload retains the newest complete entries
+// that fit in the byte budget. We always retain the newest entry so a single
+// large final response cannot make an otherwise valid chat appear empty.
+func workspaceBoundTranscriptSnapshotPayload(entries []readmodels.TranscriptEntry, maxBytes int) ([]readmodels.TranscriptEntry, int) {
+	if len(entries) == 0 || maxBytes <= 0 {
+		return entries, 0
+	}
+
+	start := len(entries)
+	remaining := maxBytes
+	for index := len(entries) - 1; index >= 0; index-- {
+		encoded, err := json.Marshal(entries[index])
+		entryBytes := len(encoded)
+		if start != len(entries) && (err != nil || entryBytes > remaining) {
+			break
+		}
+		start = index
+		remaining -= entryBytes
+	}
+	return append([]readmodels.TranscriptEntry(nil), entries[start:]...), start
 }
 
 func workspaceTrimTranscriptSnapshotPayload(entries []readmodels.TranscriptEntry) []readmodels.TranscriptEntry {

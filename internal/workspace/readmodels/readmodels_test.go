@@ -58,6 +58,23 @@ func TestPinnedChatsArePersistedAndSortedFirst(t *testing.T) {
 	}
 }
 
+func TestPinnedChatReorderPersistsOrderWithoutChangingChatActivity(t *testing.T) {
+	project, _ := events.NewAt(events.TypeProjectOpened, 100, map[string]any{"projectId": "p", "localPath": "/tmp/p", "title": "p"})
+	first, _ := events.NewAt(events.TypeChatCreated, 200, map[string]any{"chatId": "first", "projectId": "p", "title": "first"})
+	second, _ := events.NewAt(events.TypeChatCreated, 300, map[string]any{"chatId": "second", "projectId": "p", "title": "second"})
+	pinFirst, _ := events.NewAt(events.TypeChatPinned, 400, map[string]any{"chatId": "first", "pinned": true})
+	pinSecond, _ := events.NewAt(events.TypeChatPinned, 450, map[string]any{"chatId": "second", "pinned": true})
+	reorder, _ := events.NewAt(events.TypeChatPinnedReordered, 500, map[string]any{"chatIds": []string{"first", "second"}})
+
+	state := Replay([]events.Event{project, first, second, pinFirst, pinSecond, reorder})
+	if state.ChatsByID["first"].PinnedOrder <= state.ChatsByID["second"].PinnedOrder {
+		t.Fatalf("expected first to have the higher pinned rank: %#v", state.ChatsByID)
+	}
+	if state.ChatsByID["first"].UpdatedAt != 400 || state.ChatsByID["second"].UpdatedAt != 450 {
+		t.Fatalf("pin reorder must not change chat activity timestamps: %#v", state.ChatsByID)
+	}
+}
+
 func TestReplayIgnoresDuplicateQueuedMessageEventIDs(t *testing.T) {
 	queued, err := events.NewAt(events.TypeQueuedMessageEnqueued, 100, map[string]any{
 		"chatId": "chat-1",

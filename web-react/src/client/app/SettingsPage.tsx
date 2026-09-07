@@ -3417,7 +3417,23 @@ export function SettingsPage() {
     }
   }
 
-  const handleCodexManagerLoginCompleted = useCallback(async () => {
+  const handleCodexManagerLoginCompleted = useCallback(async (accountName: string) => {
+    // A completed device login replaces credentials. Do not render the old
+    // quota sample as if it belonged to the new token: block until the live
+    // account check has written its new safe status projection.
+    const response = await fetch(`/api/codex-manager/accounts/${encodeURIComponent(accountName)}/check`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ forceRefresh: true }),
+    });
+    if (!response.ok) throw new Error(await response.text());
+    // Scan after sign-in as well, so the account ↔ Chrome association reflects
+    // the profile used for the just-completed login.
+    const scan = await fetch("/api/codex-manager/browser/scan", {
+      method: "POST",
+      headers: { Accept: "application/json" },
+    });
+    if (!scan.ok) throw new Error(await scan.text());
     await state.handleReadAppSettings();
     setCodexManagerRefreshKey((current) => current + 1);
   }, [state.handleReadAppSettings]);

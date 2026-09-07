@@ -1,12 +1,10 @@
 import { StrictMode } from "react"
 import { createRoot } from "react-dom/client"
-import { BrowserRouter } from "react-router-dom"
 import "@fontsource-variable/bricolage-grotesque"
 import "@fontsource-variable/vazirmatn"
 import "@fontsource-variable/noto-naskh-arabic"
 import "@fontsource-variable/noto-kufi-arabic"
-import { App } from "./client/app/App"
-import { ThemeProvider } from "./client/hooks/useTheme"
+import { AppBootstrap } from "./client/app/AppBootstrap"
 import "@xterm/xterm/css/xterm.css"
 import "./index.css"
 
@@ -37,10 +35,6 @@ window.addEventListener("vite:preloadError", (event) => {
 
 createRoot(container).render(
   <StrictMode>
-    <BrowserRouter>
-      <ThemeProvider>
-        <App />
-      </ThemeProvider>
-    </BrowserRouter>
+    <AppBootstrap />
   </StrictMode>
 )

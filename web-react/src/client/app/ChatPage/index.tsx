@@ -1,5 +1,7 @@
 import {
   memo,
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -21,16 +23,11 @@ import {
   ChatNavbar,
   type ChatSearchMatch,
 } from "../../components/chat-ui/ChatNavbar";
-import { BrowserPanel } from "../../components/chat-ui/BrowserPanel";
 import type { MessageIndexItem } from "../../components/chat-ui/ConversationMinimap";
-import { GitPanel } from "../../components/chat-ui/GitPanel";
-import {
-  ProjectFilesPanel,
-  type ProjectFileEntry,
-} from "../../components/chat-ui/ProjectFilesPanel";
+import type { GitPanel } from "../../components/chat-ui/GitPanel";
+import type { ProjectFileEntry } from "../../components/chat-ui/ProjectFilesPanel";
 import { readProjectFilePreview } from "../../components/chat-ui/projectFilesData";
 import {
-  FilePreviewPanel,
   fileRouteHref,
   type FilePreviewResponse,
 } from "../../components/file-preview/FilePreviewPanel";
@@ -80,8 +77,6 @@ import {
 } from "../useAbolqasemState";
 import type { AgentProvider, CodexExecutionMode } from "../../../shared/types";
 import { ChatInputDock } from "./ChatInputDock";
-import { ChatTranscriptViewport } from "./ChatTranscriptViewport";
-import { TerminalWorkspaceShell } from "./TerminalWorkspaceShell";
 import {
   getOrderedRightSidebarLayout,
   getRightSidebarPanelDefaultSizes,
@@ -107,6 +102,21 @@ import {
   shouldShowTranscriptUnreadIndicator,
 } from "./utils";
 import { useI18n } from "../../i18n/context";
+
+// Terminal and diff rendering pull in xterm and the diff engine. They are
+// useful only after a user opens the corresponding pane, so keep them out of
+// the chat's startup execution path.
+const LazyGitPanel = lazy(() => import("../../components/chat-ui/GitPanel").then((module) => ({ default: module.GitPanel })));
+const LazyTerminalWorkspaceShell = lazy(() => import("./TerminalWorkspaceShell").then((module) => ({ default: module.TerminalWorkspaceShell })));
+// Message rendering imports markdown, syntax highlighting, and the full tool
+// renderer tree. Keep that parse/evaluation work behind a boundary so the
+// shell and composer become interactive before a long transcript is mounted.
+const LazyChatTranscriptViewport = lazy(() => import("./ChatTranscriptViewport").then((module) => ({ default: module.ChatTranscriptViewport })));
+// These panes are opt-in UI. Statically importing them made every fresh chat
+// parse file previews and browser controls even when their panel stayed shut.
+const LazyBrowserPanel = lazy(() => import("../../components/chat-ui/BrowserPanel").then((module) => ({ default: module.BrowserPanel })));
+const LazyProjectFilesPanel = lazy(() => import("../../components/chat-ui/ProjectFilesPanel").then((module) => ({ default: module.ProjectFilesPanel })));
+const LazyFilePreviewPanel = lazy(() => import("../../components/file-preview/FilePreviewPanel").then((module) => ({ default: module.FilePreviewPanel })));
 
 export {
   getOrderedRightSidebarLayout,
@@ -857,8 +867,16 @@ type ChatSidebarContentProps = ComponentProps<typeof GitPanel>;
 const ChatSidebarContent = memo(function ChatSidebarContent(
   props: ChatSidebarContentProps,
 ) {
-  return <GitPanel {...props} diffs={props.diffs ?? EMPTY_DIFF_SNAPSHOT} />;
+  return (
+    <Suspense fallback={<PaneLoading />}>
+      <LazyGitPanel {...props} diffs={props.diffs ?? EMPTY_DIFF_SNAPSHOT} />
+    </Suspense>
+  );
 });
+
+function PaneLoading() {
+  return <div className="flex h-full items-center justify-center"><Loader2 className="size-5 animate-spin text-muted-foreground" /></div>;
+}
 
 export function getTerminalPanelDefaultSizes(
   showTerminalPane: boolean,
@@ -1051,23 +1069,27 @@ function ChatWorkspace({
             } as CSSProperties
           }
         >
-          <TerminalWorkspaceShell
-            projectId={projectId}
-            fixedTerminalHeight={fixedTerminalHeight}
-            terminalLayout={terminalLayout}
-            addTerminal={addTerminal}
-            socket={socket}
-            connectionStatus={connectionStatus}
-            scrollback={scrollback}
-            minColumnWidth={minColumnWidth}
-            splitTerminalShortcut={splitTerminalShortcut}
-            pendingCommandsByTerminalId={pendingCommandsByTerminalId}
-            focusRequestVersion={terminalFocusRequestVersion}
-            onTerminalCommandSent={onTerminalCommandSent}
-            onInitialTerminalCommandSent={onInitialTerminalCommandSent}
-            onRemoveTerminal={onRemoveTerminal}
-            onTerminalLayout={onTerminalLayout}
-          />
+          {showTerminalPane ? (
+            <Suspense fallback={<PaneLoading />}>
+              <LazyTerminalWorkspaceShell
+                projectId={projectId}
+                fixedTerminalHeight={fixedTerminalHeight}
+                terminalLayout={terminalLayout}
+                addTerminal={addTerminal}
+                socket={socket}
+                connectionStatus={connectionStatus}
+                scrollback={scrollback}
+                minColumnWidth={minColumnWidth}
+                splitTerminalShortcut={splitTerminalShortcut}
+                pendingCommandsByTerminalId={pendingCommandsByTerminalId}
+                focusRequestVersion={terminalFocusRequestVersion}
+                onTerminalCommandSent={onTerminalCommandSent}
+                onInitialTerminalCommandSent={onInitialTerminalCommandSent}
+                onRemoveTerminal={onRemoveTerminal}
+                onTerminalLayout={onTerminalLayout}
+              />
+            </Suspense>
+          ) : null}
         </div>
       </ResizablePanel>
     </ResizablePanelGroup>
@@ -1957,15 +1979,22 @@ export function ChatPage() {
     t.common.cancel,
   ]);
 
-  const refreshCodexLock = useCallback(() => {
+  const refreshCodexLock = useCallback(async () => {
     if (!state.activeChatId) return;
-    // Match the live polling path: queue the refresh immediately and let the
-    // chat subscription render its snapshot. A manual text refresh must never
-    // look like a slow lock/takeover operation.
-    void state.socket
-      .command({ type: "chat.refresh", chatId: state.activeChatId })
-      .catch(() => undefined);
-  }, [state.activeChatId, state.socket]);
+    setCodexLockActionPending(true);
+    try {
+      // This deliberately uses the local HTTP snapshot endpoint rather than
+      // the WebSocket. Refreshing transcript text must work while the socket
+      // is reconnecting and must never depend on the Codex app-server.
+      await state.refreshChatTranscript();
+    } catch {
+      // This is an opportunistic, local-only refresh. Connection recovery owns
+      // its own status; an unobtrusive retry is better than interrupting a
+      // locked composer with a modal error.
+    } finally {
+      setCodexLockActionPending(false);
+    }
+  }, [state.activeChatId, state.refreshChatTranscript]);
 
   const releaseCodexLock = useCallback(async () => {
     if (!state.activeChatId) return;
@@ -2416,14 +2445,16 @@ export function ChatPage() {
                 className="relative h-full min-h-0 select-text"
                 {...{ [CHAT_SELECTION_ZONE_ATTRIBUTE]: "" }}
               >
-                <FilePreviewPanel
-                  preview={projectFilePreview}
-                  title={projectFilePreviewTarget.name}
-                  hideHeader
-                  surface="bare"
-                  className="h-full"
-                  codeFrameClassName="h-full !rounded-none !border-0 !bg-transparent !shadow-none"
-                />
+                <Suspense fallback={<PaneLoading />}>
+                  <LazyFilePreviewPanel
+                    preview={projectFilePreview}
+                    title={projectFilePreviewTarget.name}
+                    hideHeader
+                    surface="bare"
+                    className="h-full"
+                    codeFrameClassName="h-full !rounded-none !border-0 !bg-transparent !shadow-none"
+                  />
+                </Suspense>
                 {projectFilePreviewLoading ? (
                   <div className="pointer-events-none absolute left-1/2 top-3 z-20 flex -translate-x-1/2 items-center gap-2 rounded-full border border-border bg-background/90 px-3 py-1.5 text-xs text-muted-foreground shadow-lg backdrop-blur">
                     <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -2540,50 +2571,52 @@ export function ChatPage() {
           gitStatus={state.chatDiffSnapshot?.status}
         />
         {projectFilePreviewContent ?? (
-          <ChatTranscriptViewport
-            activeChatId={state.activeChatId}
-            listRef={transcriptListRef}
-            messages={state.messages}
-            queuedMessages={state.queuedMessages}
-            transcriptPaddingBottom={transcriptPaddingBottom}
-            localPath={state.runtime?.localPath}
-            latestToolIds={state.latestToolIds}
-            isHistoryLoading={state.isHistoryLoading}
-            hasOlderHistory={state.hasOlderHistory}
-            isProcessing={state.isProcessing}
-            runtimeStatus={state.runtimeStatus}
-            runtimeProvider={state.runtime?.provider ?? null}
-            readOnly={codexChatReadOnly}
-            isDraining={state.isDraining}
-            commandError={state.commandError}
-            loadOlderHistory={state.loadOlderHistory}
-            onStopDraining={state.handleStopDraining}
-            onRemoveQueuedMessage={state.handleRemoveQueuedMessage}
-            onSteerQueuedMessage={state.handleSteerQueuedMessage}
-            onInterruptQueuedMessage={state.handleInterruptQueuedMessage}
-            onEditQueuedMessage={handleEditQueuedMessage}
-            onRemoveAllQueuedMessages={handleRemoveAllQueuedMessages}
-            onOpenLocalLink={state.handleOpenLocalLink}
-            editorPreset={editorPreset}
-            editorCommandTemplate={editorCommandTemplate}
-            platform={state.localProjects?.machine.platform}
-            onAskUserQuestionSubmit={state.handleAskUserQuestion}
-            onApprovalRequestSubmit={state.handleApprovalRequest}
-            onExitPlanModeConfirm={state.handleExitPlanMode}
-            onRetryTurn={handleRetryFailedTurn}
-            checkpoints={state.chatDiffSnapshot?.checkpoints ?? []}
-            onRestoreCheckpoint={state.handleRestoreCheckpoint}
-            showScrollButton={showScrollToBottom && state.messages.length > 0}
-            showUnreadDot={hasUnreadMessages}
-            onIsAtEndChange={onIsAtEndChange}
-            scrollToBottom={() => scrollToTranscriptEnd(true)}
-            typedEmptyStateText={typedEmptyStateText}
-            isEmptyStateTypingComplete={isEmptyStateTypingComplete}
-            isPageFileDragActive={isPageFileDragActive}
-            showEmptyState={showEmptyState}
-            emptyStateText={t.chat.emptyState}
-            onMinimapScrollToMessage={handleMinimapScrollToMessage}
-          />
+          <Suspense fallback={<PaneLoading />}>
+            <LazyChatTranscriptViewport
+              activeChatId={state.activeChatId}
+              listRef={transcriptListRef}
+              messages={state.messages}
+              queuedMessages={state.queuedMessages}
+              transcriptPaddingBottom={transcriptPaddingBottom}
+              localPath={state.runtime?.localPath}
+              latestToolIds={state.latestToolIds}
+              isHistoryLoading={state.isHistoryLoading}
+              hasOlderHistory={state.hasOlderHistory}
+              isProcessing={state.isProcessing}
+              runtimeStatus={state.runtimeStatus}
+              runtimeProvider={state.runtime?.provider ?? null}
+              readOnly={codexChatReadOnly}
+              isDraining={state.isDraining}
+              commandError={state.commandError}
+              loadOlderHistory={state.loadOlderHistory}
+              onStopDraining={state.handleStopDraining}
+              onRemoveQueuedMessage={state.handleRemoveQueuedMessage}
+              onSteerQueuedMessage={state.handleSteerQueuedMessage}
+              onInterruptQueuedMessage={state.handleInterruptQueuedMessage}
+              onEditQueuedMessage={handleEditQueuedMessage}
+              onRemoveAllQueuedMessages={handleRemoveAllQueuedMessages}
+              onOpenLocalLink={state.handleOpenLocalLink}
+              editorPreset={editorPreset}
+              editorCommandTemplate={editorCommandTemplate}
+              platform={state.localProjects?.machine.platform}
+              onAskUserQuestionSubmit={state.handleAskUserQuestion}
+              onApprovalRequestSubmit={state.handleApprovalRequest}
+              onExitPlanModeConfirm={state.handleExitPlanMode}
+              onRetryTurn={handleRetryFailedTurn}
+              checkpoints={state.chatDiffSnapshot?.checkpoints ?? []}
+              onRestoreCheckpoint={state.handleRestoreCheckpoint}
+              showScrollButton={showScrollToBottom && state.messages.length > 0}
+              showUnreadDot={hasUnreadMessages}
+              onIsAtEndChange={onIsAtEndChange}
+              scrollToBottom={() => scrollToTranscriptEnd(true)}
+              typedEmptyStateText={typedEmptyStateText}
+              isEmptyStateTypingComplete={isEmptyStateTypingComplete}
+              isPageFileDragActive={isPageFileDragActive}
+              showEmptyState={showEmptyState}
+              emptyStateText={t.chat.emptyState}
+              onMinimapScrollToMessage={handleMinimapScrollToMessage}
+            />
+          </Suspense>
         )}
       </CardContent>
 
@@ -2733,28 +2766,32 @@ export function ChatPage() {
   ]);
   const rightPanelContent =
     activeRightPanel === "browser" && projectId ? (
-      <BrowserPanel
-        projectId={projectId}
-        socket={state.socket}
-        onClose={handleCloseRightSidebar}
-        onRunQuickAction={handleRunQuickAction}
-      />
+      <Suspense fallback={<PaneLoading />}>
+        <LazyBrowserPanel
+          projectId={projectId}
+          socket={state.socket}
+          onClose={handleCloseRightSidebar}
+          onRunQuickAction={handleRunQuickAction}
+        />
+      </Suspense>
     ) : activeRightPanel === "files" && projectId ? (
-      <ProjectFilesPanel
-        projectId={projectId}
-        localPath={state.runtime?.localPath ?? state.navbarLocalPath}
-        initialPath={projectFilePreviewTarget?.path}
-        previewMode="none"
-        showCloseButton={false}
-        focusSearchToken={filesPanelFocusToken || undefined}
-        onClose={handleCloseRightSidebar}
-        onSelectFile={handleSelectProjectFile}
-        onOpenFile={handleOpenDiffFile}
-        onOpenInFinder={handleOpenDiffInFinder}
-        onCopyFilePath={handleCopyDiffFilePath}
-        onCopyRelativePath={handleCopyDiffRelativePath}
-      />
-    ) : gitPanelContentProps ? (
+      <Suspense fallback={<PaneLoading />}>
+        <LazyProjectFilesPanel
+          projectId={projectId}
+          localPath={state.runtime?.localPath ?? state.navbarLocalPath}
+          initialPath={projectFilePreviewTarget?.path}
+          previewMode="none"
+          showCloseButton={false}
+          focusSearchToken={filesPanelFocusToken || undefined}
+          onClose={handleCloseRightSidebar}
+          onSelectFile={handleSelectProjectFile}
+          onOpenFile={handleOpenDiffFile}
+          onOpenInFinder={handleOpenDiffInFinder}
+          onCopyFilePath={handleCopyDiffFilePath}
+          onCopyRelativePath={handleCopyDiffRelativePath}
+        />
+      </Suspense>
+    ) : activeRightPanel === "git" && gitPanelContentProps ? (
       <ChatSidebarContent {...gitPanelContentProps} />
     ) : null;
   const rightSidebarPanelDefaultSizes = getRightSidebarPanelDefaultSizes(
