@@ -72,6 +72,22 @@ func TestWorkspaceNativeHistoryDoesNotReadStoredMessagesStream(t *testing.T) {
 	if history["hasOlder"] != true {
 		t.Fatalf("expected native history to report older entries, got %#v", history)
 	}
+	olderCursor, ok := history["olderCursor"].(*string)
+	if !ok || olderCursor == nil || *olderCursor != workspaceTranscriptCursor(messages[0]) {
+		t.Fatalf("expected exclusive cursor for the first returned native entry, got %#v", history)
+	}
+	older, err := workspaceLoadStoredChatHistory(chat.ID, *olderCursor, 4)
+	if err != nil {
+		t.Fatalf("loading the preceding native page returned error: %v", err)
+	}
+	olderMessages := older["messages"].([]readmodels.TranscriptEntry)
+	if len(olderMessages) != 1 || olderMessages[0]["_id"] == messages[0]["_id"] {
+		t.Fatalf("expected exactly the native entry before the page boundary, got %#v", older)
+	}
+	oldestCursor, _ := older["olderCursor"].(*string)
+	if older["hasOlder"] != false || oldestCursor != nil {
+		t.Fatalf("expected the oldest native page to end pagination, got %#v", older)
+	}
 
 	around, err := workspaceLoadStoredChatHistoryAround(chat.ID, items[1].ID, 3)
 	if err != nil {

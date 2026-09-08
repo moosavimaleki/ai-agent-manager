@@ -1026,7 +1026,12 @@ function AbolqasemSidebarImpl({
             <PinnedChatsSection
               chats={sidebarChats}
               orderedChatIds={optimisticPinnedChatOrder ?? undefined}
-              renderChatRow={renderChatRow}
+              activeChatId={activeChatId}
+              nowMs={nowMs}
+              onSelectChat={(chatId) => {
+                navigate(chatRoute(chatId))
+                onClose()
+              }}
               onUnpin={onPinChat}
               onReorder={reorderPinnedChats}
             />

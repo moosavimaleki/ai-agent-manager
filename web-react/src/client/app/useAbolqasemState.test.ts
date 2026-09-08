@@ -281,7 +281,8 @@ describe("shouldMarkActiveChatRead", () => {
 })
 
 describe("getActiveChatRefreshDelay", () => {
-  test("refreshes the selected browser tab every second and backs off hidden tabs", () => {
+  test("refreshes the selected browser tab every five seconds and backs off hidden tabs", () => {
+    expect(ACTIVE_CHAT_REFRESH_INTERVAL_MS).toBe(5_000)
     expect(getActiveChatRefreshDelay({ visibilityState: "visible" })).toBe(ACTIVE_CHAT_REFRESH_INTERVAL_MS)
     expect(getActiveChatRefreshDelay({ visibilityState: "hidden" })).toBe(BACKGROUND_CHAT_REFRESH_INTERVAL_MS)
   })

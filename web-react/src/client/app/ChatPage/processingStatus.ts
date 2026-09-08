@@ -35,6 +35,9 @@ export function getProcessingStatus(
     if (message.kind === "file_change" && message.status === "inProgress") {
       return "applying_changes"
     }
+    if (message.kind === "assistant_text" && message.status === "inProgress") {
+      return "writing_response"
+    }
   }
   return "thinking"
 }

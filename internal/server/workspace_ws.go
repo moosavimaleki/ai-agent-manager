@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -19,6 +20,14 @@ import (
 var workspaceWSUpgrader = websocket.Upgrader{
 	CheckOrigin: workspaceWSOriginAllowed,
 }
+
+const (
+	workspaceWSOutboundBuffer       = 32
+	workspaceWSWriteTimeout         = 5 * time.Second
+	workspaceMinChatRefreshInterval = 5 * time.Second
+)
+
+var errWorkspaceConnectionBackpressure = errors.New("browser tab is not consuming websocket messages")
 
 var workspaceTerminals = newWorkspaceTerminalHub()
 
@@ -64,8 +73,13 @@ type workspaceConnection struct {
 	conn *websocket.Conn
 	hub  *workspaceTerminalHub
 
-	writeMu sync.Mutex
-	writeFn func(protocol.ServerEnvelope) error
+	writeMu         sync.Mutex
+	writeFn         func(protocol.ServerEnvelope) error
+	outbound        chan protocol.ServerEnvelope
+	done            chan struct{}
+	closeMu         sync.Once
+	refreshMu       sync.Mutex
+	lastChatRefresh map[string]time.Time
 
 	subscriptionsMu sync.Mutex
 	subscriptions   map[string]workspaceSubscription
@@ -150,9 +164,13 @@ func handleWorkspaceWS(w http.ResponseWriter, r *http.Request) {
 		conn:          conn,
 		hub:           workspaceTerminals,
 		subscriptions: map[string]workspaceSubscription{},
+		outbound:      make(chan protocol.ServerEnvelope, workspaceWSOutboundBuffer),
+		done:          make(chan struct{}),
 	}
+	go workspaceConn.writeLoop()
 	workspaceConnections.add(workspaceConn)
 	defer workspaceConnections.remove(workspaceConn)
+	defer workspaceConn.shutdown()
 	defer workspaceConn.close()
 
 	for {
@@ -709,11 +727,18 @@ func (c *workspaceConnection) handleCommand(envelope protocol.ClientEnvelope) *p
 			response := protocol.ErrorEnvelope(envelope.ID, err.Error())
 			return &response
 		}
-		if forceTranscriptRefresh {
-			workspaceInvalidateNativeHistoryCacheForChat(chatID)
+		if forceTranscriptRefresh || c.allowChatRefresh(chatID, time.Now()) {
+			if forceTranscriptRefresh {
+				workspaceInvalidateNativeHistoryCacheForChat(chatID)
+			}
+			RecoverQueuedMessageForChat(chatID)
+			// Refresh is a per-tab polling command. Broadcasting its large chat
+			// snapshot to every tab creates N² traffic when several tabs are open:
+			// every tab polls and every poll wakes every other tab. Actual state
+			// changes still use the registry broadcasts; this refresh only answers
+			// the requesting connection's subscriptions.
+			c.sendChatSnapshot(chatID)
 		}
-		RecoverQueuedMessageForChat(chatID)
-		workspaceConnections.broadcast(chatID)
 		response := protocol.AckEnvelope(envelope.ID, map[string]any{"ok": true})
 		return &response
 	case protocol.CommandChatClaimCodexSession:
@@ -1090,9 +1115,55 @@ func (c *workspaceConnection) write(envelope protocol.ServerEnvelope) error {
 	if c.writeFn != nil {
 		return c.writeFn(envelope)
 	}
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	return c.conn.WriteJSON(envelope)
+	if c.outbound == nil || c.done == nil {
+		return errors.New("workspace websocket is not initialized")
+	}
+	select {
+	case <-c.done:
+		return errWorkspaceConnectionBackpressure
+	default:
+	}
+	select {
+	case <-c.done:
+		return errWorkspaceConnectionBackpressure
+	case c.outbound <- envelope:
+		return nil
+	default:
+		// A backgrounded or dead tab must never make broadcasts or another
+		// tab's command ACK wait behind its full socket. Closing only this
+		// connection lets the browser reconnect and resubscribe cleanly.
+		c.shutdown()
+		return errWorkspaceConnectionBackpressure
+	}
+}
+
+func (c *workspaceConnection) writeLoop() {
+	for {
+		select {
+		case <-c.done:
+			return
+		case envelope := <-c.outbound:
+			c.writeMu.Lock()
+			_ = c.conn.SetWriteDeadline(time.Now().Add(workspaceWSWriteTimeout))
+			err := c.conn.WriteJSON(envelope)
+			c.writeMu.Unlock()
+			if err != nil {
+				c.shutdown()
+				return
+			}
+		}
+	}
+}
+
+func (c *workspaceConnection) shutdown() {
+	c.closeMu.Do(func() {
+		if c.done != nil {
+			close(c.done)
+		}
+		if c.conn != nil {
+			_ = c.conn.Close()
+		}
+	})
 }
 
 func (c *workspaceConnection) subscribe(subscriptionID string, key string, topic protocol.SubscriptionTopic) {
@@ -1162,6 +1233,51 @@ func (c *workspaceConnection) subscription(subscriptionID string) (workspaceSubs
 	defer c.subscriptionsMu.Unlock()
 	subscription, ok := c.subscriptions[subscriptionID]
 	return subscription, ok
+}
+
+func (c *workspaceConnection) sendChatSnapshot(chatID string) {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return
+	}
+	c.subscriptionsMu.Lock()
+	subscriptions := make(map[string]workspaceSubscription)
+	for subscriptionID, subscription := range c.subscriptions {
+		if subscription.key == chatSubscription+chatID {
+			subscriptions[subscriptionID] = subscription
+		}
+	}
+	c.subscriptionsMu.Unlock()
+
+	// A tab normally has one chat subscription. Grouping by recent limit keeps
+	// accidental duplicate consumers from reparsing the same transcript.
+	snapshots := make(map[int]any)
+	for subscriptionID, subscription := range subscriptions {
+		recentLimit := subscriptionRecentLimit(subscription.topic)
+		snapshot, ok := snapshots[recentLimit]
+		if !ok {
+			snapshot = workspaceChatSnapshot(chatID, recentLimit)
+			snapshots[recentLimit] = snapshot
+		}
+		_ = c.write(protocol.SnapshotEnvelope(subscriptionID, protocol.SnapshotChat, snapshot))
+	}
+}
+
+func (c *workspaceConnection) allowChatRefresh(chatID string, now time.Time) bool {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return false
+	}
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
+	if c.lastChatRefresh == nil {
+		c.lastChatRefresh = make(map[string]time.Time)
+	}
+	if previous := c.lastChatRefresh[chatID]; !previous.IsZero() && now.Sub(previous) < workspaceMinChatRefreshInterval {
+		return false
+	}
+	c.lastChatRefresh[chatID] = now
+	return true
 }
 
 func workspaceSubscriptionKey(topic protocol.SubscriptionTopic) string {

@@ -229,6 +229,10 @@ func TestStreamNormalizerMapsFileChanges(t *testing.T) {
 
 func TestStreamNormalizerMapsNativeDeltasAndTurnPlan(t *testing.T) {
 	normalizer := NewStreamNormalizer()
+	agentMessage := normalizer.HandleNotification(notification("item/agentMessage/delta", map[string]any{"itemId": "msg-1", "delta": "still working"}))
+	if len(agentMessage) != 1 || agentMessage[0].Entry["kind"] != "assistant_text" || agentMessage[0].Entry["itemId"] != "msg-1" || agentMessage[0].Entry["textDelta"] != "still working" || agentMessage[0].Entry["status"] != "inProgress" {
+		t.Fatalf("unexpected agent message delta: %#v", agentMessage)
+	}
 	command := normalizer.HandleNotification(notification("item/commandExecution/outputDelta", map[string]any{"itemId": "cmd-1", "delta": "hello\n"}))
 	if len(command) != 1 || command[0].Entry["kind"] != "command_execution" || command[0].Entry["outputDelta"] != "hello\n" {
 		t.Fatalf("unexpected command delta: %#v", command)
@@ -238,6 +242,15 @@ func TestStreamNormalizerMapsNativeDeltasAndTurnPlan(t *testing.T) {
 	}))
 	if len(plan) != 1 || plan[0].Entry["kind"] != "turn_plan" || plan[0].Entry["turnId"] != "turn-1" {
 		t.Fatalf("unexpected plan: %#v", plan)
+	}
+}
+
+func TestStreamNormalizerKeepsAgentMessageIDOnCompletion(t *testing.T) {
+	events := NewStreamNormalizer().HandleNotification(notification("item/completed", map[string]any{
+		"item": map[string]any{"type": "agentMessage", "id": "msg-1", "text": "done"},
+	}))
+	if len(events) != 1 || events[0].Entry["kind"] != "assistant_text" || events[0].Entry["itemId"] != "msg-1" || events[0].Entry["text"] != "done" || events[0].Entry["status"] != "completed" {
+		t.Fatalf("unexpected completed agent message: %#v", events)
 	}
 }
 

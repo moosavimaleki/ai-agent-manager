@@ -48,6 +48,13 @@ describe("getProcessingStatus", () => {
     ], "running")).toBe("running_mcp_tool")
   })
 
+  test("shows writing activity while an app-server message is streaming", () => {
+    expect(getProcessingStatus([
+      message({ kind: "user_prompt", content: "status", attachments: [] }),
+      message({ kind: "assistant_text", text: "working", itemId: "msg-1", status: "inProgress" }),
+    ], "running")).toBe("writing_response")
+  })
+
   test("keeps the explicit waiting-for-user state", () => {
     expect(getProcessingStatus([], "waiting_for_user")).toBe("waiting_for_user")
   })

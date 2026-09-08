@@ -50,6 +50,7 @@ import {
 } from "../../app/chatFocusPolicy";
 import { ChatPreferenceControls } from "./ChatPreferenceControls";
 import { SessionHealthPopover } from "./SessionHealthPopover";
+import { AgentActivityIndicator } from "./AgentActivityIndicator";
 import {
   AttachmentFileCard,
   AttachmentImageCard,
@@ -216,6 +217,9 @@ interface Props {
   onCancel?: () => void;
   disabled: boolean;
   connectionStatus?: "connecting" | "connected" | "disconnected";
+  runtimeStatus?: string | null;
+  processingStatus?: string | null;
+  turnStartedAt?: number | null;
   canCancel?: boolean;
   chatId?: string | null;
   projectId?: string | null;
@@ -312,6 +316,9 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput(
     onCancel,
     disabled,
     connectionStatus = "connected",
+    runtimeStatus = null,
+    processingStatus = null,
+    turnStartedAt = null,
     canCancel,
     chatId,
     projectId,
@@ -469,6 +476,10 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput(
   const selectedAttachment =
     attachments.find((attachment) => attachment.id === selectedAttachmentId) ??
     null;
+
+  useLayoutEffect(() => {
+    onLayoutChange?.();
+  }, [onLayoutChange, runtimeStatus]);
 
   const cleanupAttachmentPreview = useCallback(
     (attachment: ComposerAttachment) => {
@@ -1165,6 +1176,14 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput(
               )}
               <span>{connectionStatusLabel}</span>
             </div>
+          ) : null}
+          {!connectionUnavailable ? (
+            <AgentActivityIndicator
+              runtimeStatus={runtimeStatus}
+              activity={processingStatus}
+              provider={activeProvider}
+              startedAt={turnStartedAt}
+            />
           ) : null}
           {attachments.length > 0 ? (
             <ScrollArea className="overflow-x-auto overflow-y-hidden whitespace-nowrap px-2 pb-2">

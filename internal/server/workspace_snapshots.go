@@ -161,6 +161,10 @@ func workspaceChatSnapshot(chatID string, recentLimit int) any {
 		coordinator := workspaceAgentCoordinator()
 		snapshot := readmodels.DeriveChatSnapshot(storeState, coordinator.ActiveStatuses(), coordinator.DrainingChatIDs(), chatID, transcript)
 		if snapshot != nil {
+			if active, ok := coordinator.ActiveTurnSnapshot(chatID); ok {
+				snapshot.Runtime.TurnStartedAt = active.StartedAt.UnixMilli()
+				snapshot.Messages = workspaceMergeLiveTranscript(snapshot.Messages, active.LiveTranscript)
+			}
 			if pendingTool := coordinator.PendingTool(chatID); pendingTool != nil {
 				snapshot.Messages = append(snapshot.Messages, workspacePendingToolTranscriptEntry(pendingTool))
 			}
@@ -180,6 +184,39 @@ func workspaceChatSnapshot(chatID string, recentLimit int) any {
 		return snapshot
 	}
 	return nil
+}
+
+// workspaceMergeLiveTranscript overlays coalesced app-server events on the
+// provider-owned JSONL transcript. Completed native entries win once they are
+// durable, while in-flight deltas remain visible immediately.
+func workspaceMergeLiveTranscript(durable, live []readmodels.TranscriptEntry) []readmodels.TranscriptEntry {
+	if len(live) == 0 {
+		return durable
+	}
+	result := append([]readmodels.TranscriptEntry(nil), durable...)
+	for _, entry := range live {
+		if workspaceEntryString(entry, "kind") == transcript.KindAssistantText {
+			text := strings.TrimSpace(workspaceEntryString(entry, "text"))
+			if text != "" && workspaceTranscriptContainsAssistantText(durable, text) {
+				continue
+			}
+		}
+		result = append(result, entry)
+	}
+	return result
+}
+
+func workspaceTranscriptContainsAssistantText(entries []readmodels.TranscriptEntry, text string) bool {
+	for index := len(entries) - 1; index >= 0; index-- {
+		entry := entries[index]
+		if workspaceEntryString(entry, "kind") != transcript.KindAssistantText {
+			continue
+		}
+		if strings.TrimSpace(workspaceEntryString(entry, "text")) == text {
+			return true
+		}
+	}
+	return false
 }
 
 // Native Codex session JSONL does not persist item/tool/requestUserInput as a
@@ -241,7 +278,9 @@ func workspaceNativeTranscriptSnapshot(chat readmodels.ChatRecord, recentLimit i
 	trimmed, omitted := workspaceBoundTranscriptSnapshotPayload(trimmed, workspaceInitialTranscriptMaxBytes)
 	if omitted > 0 {
 		hasOlder = true
-		cursor := workspaceTranscriptCursor(messages[omitted-1])
+		// The load-history cursor is exclusive, so it must identify the first
+		// retained entry, not the final omitted one.
+		cursor := workspaceTranscriptCursor(messages[omitted])
 		if cursor != "" {
 			olderCursor = &cursor
 		}
@@ -341,8 +380,10 @@ func workspaceChatTranscriptSnapshot(store *eventstore.Store, chatID string, rec
 	start += omitted
 	hasOlder := start > 0
 	var olderCursor *string
-	if hasOlder {
-		cursor := workspaceTranscriptCursor(entries[start-1])
+	if hasOlder && start < len(entries) {
+		// See workspaceLoadStoredChatHistory: callers request entries before
+		// this cursor, therefore it has to be the first visible entry.
+		cursor := workspaceTranscriptCursor(entries[start])
 		if cursor != "" {
 			olderCursor = &cursor
 		}

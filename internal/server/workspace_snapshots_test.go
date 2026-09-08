@@ -129,8 +129,32 @@ func TestWorkspaceChatSnapshotIncludesRecentTranscript(t *testing.T) {
 	if len(snapshot.Messages) != 1 || snapshot.Messages[0]["_id"] != "m2" {
 		t.Fatalf("expected only newest transcript entry, got %#v", snapshot.Messages)
 	}
-	if !snapshot.History.HasOlder || snapshot.History.OlderCursor == nil || *snapshot.History.OlderCursor != "m1" {
-		t.Fatalf("expected older history cursor m1, got %#v", snapshot.History)
+	if !snapshot.History.HasOlder || snapshot.History.OlderCursor == nil || *snapshot.History.OlderCursor != "m2" {
+		t.Fatalf("expected exclusive older history cursor m2, got %#v", snapshot.History)
+	}
+
+	page, err := workspaceLoadStoredChatHistory("chat-1", *snapshot.History.OlderCursor, 1)
+	if err != nil {
+		t.Fatalf("workspaceLoadStoredChatHistory returned error: %v", err)
+	}
+	entries, ok := page["messages"].([]readmodels.TranscriptEntry)
+	if !ok || len(entries) != 1 || entries[0]["_id"] != "m1" {
+		t.Fatalf("expected the boundary entry m1 in the older page, got %#v", page)
+	}
+}
+
+func TestWorkspaceMergeLiveTranscriptKeepsOnlyUndurableAssistantText(t *testing.T) {
+	durable := []readmodels.TranscriptEntry{
+		{"_id": "saved", "kind": "assistant_text", "text": "already saved"},
+	}
+	live := []readmodels.TranscriptEntry{
+		{"_id": "live-saved", "kind": "assistant_text", "itemId": "msg-1", "text": "already saved", "status": "completed"},
+		{"_id": "live-streaming", "kind": "assistant_text", "itemId": "msg-2", "text": "still working", "status": "inProgress"},
+	}
+
+	merged := workspaceMergeLiveTranscript(durable, live)
+	if len(merged) != 2 || workspaceEntryString(merged[1], "text") != "still working" {
+		t.Fatalf("expected only the undurable live message to be overlaid, got %#v", merged)
 	}
 }
 

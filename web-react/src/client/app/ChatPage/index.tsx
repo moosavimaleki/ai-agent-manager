@@ -77,6 +77,7 @@ import {
 } from "../useAbolqasemState";
 import type { AgentProvider, CodexExecutionMode } from "../../../shared/types";
 import { ChatInputDock } from "./ChatInputDock";
+import { getProcessingStatus } from "./processingStatus";
 import {
   getOrderedRightSidebarLayout,
   getRightSidebarPanelDefaultSizes,
@@ -2633,6 +2634,8 @@ export function ChatPage() {
         hasSelectedProject={state.hasSelectedProject}
         connectionStatus={state.connectionStatus}
         runtimeStatus={state.runtimeStatus}
+        processingStatus={getProcessingStatus(state.messages, state.runtimeStatus ?? undefined)}
+        turnStartedAt={state.runtime?.turnStartedAt}
         canCancel={state.canCancel}
         projectId={projectId}
         activeProvider={state.runtime?.provider ?? null}

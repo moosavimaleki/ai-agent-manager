@@ -41,6 +41,22 @@ describe("processTranscriptMessages", () => {
     expect(messages[3]).toMatchObject({ kind: "turn_activity", activity: "writing_response" })
   })
 
+  test("streams one Codex assistant bubble from app-server deltas", () => {
+    const messages = processTranscriptMessages([
+      entry({ kind: "assistant_text", itemId: "msg-1", textDelta: "در حال ", status: "inProgress" }),
+      entry({ kind: "assistant_text", itemId: "msg-1", textDelta: "بررسی", status: "inProgress" }),
+      entry({ kind: "assistant_text", itemId: "msg-1", text: "بررسی تمام شد", status: "completed" }),
+    ])
+
+    expect(messages).toHaveLength(1)
+    expect(messages[0]).toMatchObject({
+      kind: "assistant_text",
+      itemId: "msg-1",
+      text: "بررسی تمام شد",
+      status: "completed",
+    })
+  })
+
   test("deduplicates native and wrapped proposed-plan records by turn", () => {
     const messages = processTranscriptMessages([
       entry({ kind: "proposed_plan", turnId: "turn-1", plan: "# Initial plan" }),

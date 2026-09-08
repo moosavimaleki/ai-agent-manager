@@ -6,7 +6,6 @@ type SnapshotListener<T> = (value: T) => void
 type EventListener<T> = (value: T) => void
 export type SocketStatus = "connecting" | "connected" | "disconnected"
 type StatusListener = (status: SocketStatus) => void
-type SharedWorkerResponse = { type: "status"; status: SocketStatus } | { type: "message"; payload: string }
 
 const STALE_CONNECTION_MS = 25_000
 const HEARTBEAT_INTERVAL_MS = 15_000
@@ -50,9 +49,6 @@ function isSendToStartingProfilingEnabled() {
 export class AbolqasemSocket {
   private readonly url: string
   private ws: WebSocket | null = null
-  private sharedPort: MessagePort | null = null
-  private sharedStatus: SocketStatus = "disconnected"
-  private sharedWorkerDisabled = false
   private started = false
   private reconnectTimer: number | null = null
   private connectTimeoutTimer: number | null = null
@@ -118,15 +114,8 @@ export class AbolqasemSocket {
     window.removeEventListener("focus", this.handleWindowFocus)
     window.removeEventListener("online", this.handleOnline)
     document.removeEventListener("visibilitychange", this.handleVisibilityChange)
-    if (this.sharedPort) {
-      this.sharedPort.postMessage({ type: "dispose" })
-      this.sharedPort.close()
-      this.sharedPort = null
-      this.sharedStatus = "disconnected"
-    } else {
-      this.ws?.close()
-      this.ws = null
-    }
+    this.ws?.close()
+    this.ws = null
     for (const pending of this.pending.values()) {
       this.clearPendingTimeout(pending)
       pending.reject(new Error("Socket disposed"))
@@ -194,17 +183,6 @@ export class AbolqasemSocket {
   }
 
   ensureHealthyConnection() {
-    if (this.usesSharedWorker()) {
-      if (this.sharedStatus === "disconnected") {
-        this.reconnectNow()
-        return Promise.resolve()
-      }
-      if (this.sharedStatus === "connecting" || !this.isConnectionStale()) {
-        return Promise.resolve()
-      }
-      return this.sendPing()
-    }
-
     if (!this.ws || this.ws.readyState === WebSocket.CLOSED || this.ws.readyState === WebSocket.CLOSING) {
       this.reconnectNow()
       return Promise.resolve()
@@ -225,8 +203,7 @@ export class AbolqasemSocket {
     if (!this.started) {
       return
     }
-    if (this.usesSharedWorker()) {
-      this.connectShared()
+    if (this.ws?.readyState === WebSocket.OPEN || this.ws?.readyState === WebSocket.CONNECTING) {
       return
     }
     this.emitStatus("connecting")
@@ -290,89 +267,6 @@ export class AbolqasemSocket {
       }
       this.scheduleReconnect()
     })
-  }
-
-  private usesSharedWorker() {
-    return !this.sharedWorkerDisabled && typeof SharedWorker !== "undefined"
-  }
-
-  private connectShared() {
-    if (this.sharedPort) return
-    this.sharedStatus = "connecting"
-    this.emitStatus("connecting")
-    // Keep the worker anonymous. A named SharedWorker survives asset updates
-    // and can reconnect a freshly deployed UI to the previous bundle's worker
-    // until site data is cleared.
-    let worker: SharedWorker
-    try {
-      worker = new SharedWorker(new URL("./socket.shared-worker.ts", import.meta.url), {
-        type: "module",
-      })
-    } catch {
-      this.sharedWorkerDisabled = true
-      this.connect()
-      return
-    }
-    const port = worker.port
-    this.sharedPort = port
-    const fallBackToDirectSocket = () => {
-      if (this.sharedPort !== port || this.sharedStatus === "connected") return
-      this.clearConnectTimeout()
-      // A failed SharedWorker may already own an accepted browser command.
-      // Transfer retryable prompts back to this instance before disposing the
-      // port so the direct-socket fallback cannot silently drop them.
-      for (const pending of this.pending.values()) {
-        if (pending.retryAfterReconnect) this.enqueueRetryableCommand(pending.envelope)
-      }
-      port.postMessage({ type: "dispose" })
-      port.close()
-      this.sharedPort = null
-      this.sharedStatus = "disconnected"
-      this.sharedWorkerDisabled = true
-      this.emitStatus("disconnected")
-      this.connect()
-    }
-    this.connectTimeoutTimer = window.setTimeout(fallBackToDirectSocket, CONNECT_TIMEOUT_MS)
-    worker.addEventListener("error", fallBackToDirectSocket)
-    port.addEventListener("message", (event: MessageEvent<SharedWorkerResponse>) => {
-      this.handleSharedWorkerMessage(event.data)
-    })
-    port.start()
-    port.postMessage({ type: "start", url: this.url })
-    for (const [id, subscription] of this.subscriptions.entries()) {
-      port.postMessage({ type: "send", envelope: { v: 1, type: "subscribe", id, topic: subscription.topic } })
-    }
-    while (this.outboundQueue.length > 0) {
-      const envelope = this.outboundQueue.shift()
-      if (envelope && envelope.type !== "subscribe" && envelope.type !== "unsubscribe") {
-        port.postMessage({ type: "send", envelope })
-      }
-    }
-  }
-
-  private handleSharedWorkerMessage(message: SharedWorkerResponse) {
-    if (message.type === "message") {
-      this.handleServerMessage(message.payload)
-      return
-    }
-    this.sharedStatus = message.status
-    if (message.status === "connected") {
-      this.clearConnectTimeout()
-      this.reconnectDelayMs = 750
-      this.lastOpenAt = Date.now()
-      this.lastMessageAt = this.lastOpenAt
-      this.startHeartbeat()
-      this.emitStatus("connected")
-      return
-    }
-    if (message.status === "connecting") {
-      this.emitStatus("connecting")
-      return
-    }
-    this.stopHeartbeat()
-    this.clearPingState()
-    this.emitStatus("disconnected")
-    this.rejectPendingCommands("Disconnected")
   }
 
   private handleServerMessage(rawText: string) {
@@ -443,13 +337,10 @@ export class AbolqasemSocket {
   private rejectPendingCommands(message: string) {
     for (const [id, pending] of this.pending) {
       if (pending.retryAfterReconnect) {
-        // The SharedWorker owns the retry queue for shared sockets.  Direct
-        // sockets need the envelope put back locally before their next open.
-        if (!this.usesSharedWorker()) this.enqueueRetryableCommand(pending.envelope)
+        this.enqueueRetryableCommand(pending.envelope)
         continue
       }
       this.clearPendingTimeout(pending)
-      this.cancelSharedCommand(id)
       pending.reject(new Error(message))
       this.pending.delete(id)
     }
@@ -463,13 +354,12 @@ export class AbolqasemSocket {
       const current = this.pending.get(id)
       if (!current) return
       if (current.retryAfterReconnect) {
-        if (!this.usesSharedWorker()) this.enqueueRetryableCommand(current.envelope)
+        this.enqueueRetryableCommand(current.envelope)
         this.reconnectNow()
         this.armCommandTimeout(id)
         return
       }
       this.pending.delete(id)
-      this.cancelSharedCommand(id)
       current.reject(new Error("Request timed out; reconnecting to the local server"))
       this.reconnectNow()
     }, COMMAND_TIMEOUT_MS)
@@ -489,10 +379,6 @@ export class AbolqasemSocket {
     this.outboundQueue.push(envelope)
   }
 
-  private cancelSharedCommand(id: string) {
-    if (this.usesSharedWorker()) this.sharedPort?.postMessage({ type: "cancel-command", id })
-  }
-
   private scheduleReconnect() {
     if (this.reconnectTimer !== null) return
     this.reconnectTimer = window.setTimeout(() => {
@@ -503,7 +389,6 @@ export class AbolqasemSocket {
   }
 
   private getStatus(): SocketStatus {
-    if (this.usesSharedWorker()) return this.sharedStatus
     if (this.ws?.readyState === WebSocket.OPEN) {
       return "connected"
     }
@@ -549,10 +434,6 @@ export class AbolqasemSocket {
   }
 
   private reconnectNow() {
-    if (this.usesSharedWorker()) {
-      this.sharedPort?.postMessage({ type: "reconnect" })
-      return
-    }
     if (this.reconnectTimer !== null) {
       window.clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
@@ -614,14 +495,6 @@ export class AbolqasemSocket {
   }
 
   private enqueue(envelope: ClientEnvelope) {
-    if (this.usesSharedWorker()) {
-      if (this.sharedPort) {
-        this.sharedPort.postMessage({ type: "send", envelope })
-      } else {
-        this.outboundQueue.push(envelope)
-      }
-      return
-    }
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.sendNow(envelope)
       return
@@ -630,10 +503,6 @@ export class AbolqasemSocket {
   }
 
   private sendNow(envelope: ClientEnvelope) {
-    if (this.usesSharedWorker()) {
-      this.sharedPort?.postMessage({ type: "send", envelope })
-      return
-    }
     this.ws?.send(JSON.stringify(envelope))
   }
 }

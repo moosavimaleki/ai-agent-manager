@@ -158,6 +158,28 @@ describe("trimTrailingPastedNewlines", () => {
 })
 
 describe("ChatInput", () => {
+  test("keeps authoritative app-server activity visible beside the composer", () => {
+    const html = renderToStaticMarkup(createElement(
+      I18nProvider,
+      { locale: "fa" },
+      createElement(ChatInput, {
+        onSubmit: async () => undefined,
+        disabled: false,
+        connectionStatus: "connected",
+        runtimeStatus: "running",
+        processingStatus: "running_command",
+        turnStartedAt: Date.now() - 5_000,
+        canCancel: true,
+        activeProvider: "codex",
+        availableProviders: PROVIDERS,
+      })
+    ))
+
+    expect(html).toContain("Codex app-server")
+    expect(html).toContain("در حال اجرای دستور")
+    expect(html).toContain('role="status"')
+  })
+
   test("keeps the draft editable but disables submission while disconnected", () => {
     const html = renderToStaticMarkup(createElement(
       I18nProvider,

@@ -98,6 +98,7 @@ type ChatRuntime struct {
 	LocalPath               string          `json:"localPath"`
 	Title                   string          `json:"title"`
 	Status                  AbolqasemStatus `json:"status"`
+	TurnStartedAt           int64           `json:"turnStartedAt,omitempty"`
 	IsDraining              bool            `json:"isDraining"`
 	Provider                *string         `json:"provider"`
 	PlanMode                bool            `json:"planMode"`

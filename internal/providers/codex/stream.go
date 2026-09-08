@@ -93,6 +93,8 @@ func (n *StreamNormalizer) HandleNotification(notification codexrpc.Notification
 		return turnPlanEvents(notification.Params)
 	case "item/commandExecution/outputDelta":
 		return commandOutputDeltaEvents(notification.Params)
+	case "item/agentMessage/delta":
+		return agentMessageDeltaEvents(notification.Params)
 	case "item/fileChange/outputDelta":
 		return fileChangeDeltaEvents(notification.Params)
 	case "item/started":
@@ -176,8 +178,12 @@ func itemCompletedEvents(raw json.RawMessage) []HarnessEvent {
 			return nil
 		}
 		return []HarnessEvent{{
-			Type:  "transcript",
-			Entry: transcript.New(transcript.KindAssistantText, map[string]any{"text": text}),
+			Type: "transcript",
+			Entry: transcript.New(transcript.KindAssistantText, map[string]any{
+				"itemId": asString(params.Item["id"]),
+				"text":   text,
+				"status": "completed",
+			}),
 		}}
 	case "commandExecution":
 		return []HarnessEvent{{Type: "transcript", Entry: transcript.New(transcript.KindCommandExecution, commandExecutionFields(params.Item))}}
@@ -280,6 +286,21 @@ func commandOutputDeltaEvents(raw json.RawMessage) []HarnessEvent {
 		return nil
 	}
 	return []HarnessEvent{{Type: "transcript", Entry: transcript.New(transcript.KindCommandExecution, map[string]any{"itemId": params.ItemID, "outputDelta": params.Delta, "status": "inProgress"})}}
+}
+
+func agentMessageDeltaEvents(raw json.RawMessage) []HarnessEvent {
+	var params struct {
+		ItemID string `json:"itemId"`
+		Delta  string `json:"delta"`
+	}
+	if decodeParams(raw, &params) != nil || params.ItemID == "" || params.Delta == "" {
+		return nil
+	}
+	return []HarnessEvent{{Type: "transcript", Entry: transcript.New(transcript.KindAssistantText, map[string]any{
+		"itemId":    params.ItemID,
+		"textDelta": params.Delta,
+		"status":    "inProgress",
+	})}}
 }
 
 func fileChangeDeltaEvents(raw json.RawMessage) []HarnessEvent {

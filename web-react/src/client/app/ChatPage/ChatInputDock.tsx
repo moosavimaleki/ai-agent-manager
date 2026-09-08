@@ -24,6 +24,8 @@ interface ChatInputDockProps {
   hasSelectedProject: boolean;
   connectionStatus: AbolqasemState["connectionStatus"];
   runtimeStatus: string | null;
+  processingStatus?: string | null;
+  turnStartedAt?: number | null;
   canCancel: boolean;
   projectId: string | null;
   activeProvider: AgentProvider | null;
@@ -62,6 +64,8 @@ export const ChatInputDock = memo(function ChatInputDock({
   hasSelectedProject,
   connectionStatus,
   runtimeStatus,
+  processingStatus = null,
+  turnStartedAt = null,
   canCancel,
   projectId,
   activeProvider,
@@ -102,6 +106,9 @@ export const ChatInputDock = memo(function ChatInputDock({
           onCancel={onCancel}
           disabled={!hasSelectedProject}
           connectionStatus={connectionStatus}
+          runtimeStatus={runtimeStatus}
+          processingStatus={processingStatus}
+          turnStartedAt={turnStartedAt}
           canCancel={canCancel}
           chatId={activeChatId}
           projectId={projectId}

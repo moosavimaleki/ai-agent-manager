@@ -25,7 +25,7 @@ import { RESTORE_CHAT_INPUT_FOCUS_EVENT } from "./chatFocusPolicy"
 // A session can be receiving work in a separate Codex client. The hook stream
 // delivers updates immediately when that client emits them; this lightweight
 // refresh is the reliable fallback for in-progress transcript writes.
-export const ACTIVE_CHAT_REFRESH_INTERVAL_MS = 1_000
+export const ACTIVE_CHAT_REFRESH_INTERVAL_MS = 5_000
 export const BACKGROUND_CHAT_REFRESH_INTERVAL_MS = 15_000
 
 export function getActiveChatRefreshDelay(doc: Pick<Document, "visibilityState"> = document) {
@@ -40,6 +40,7 @@ function sameRuntime(left: ChatSnapshot["runtime"] | null | undefined, right: Ch
     && left.localPath === right.localPath
     && left.title === right.title
     && left.status === right.status
+    && left.turnStartedAt === right.turnStartedAt
     && left.isDraining === right.isDraining
     && left.provider === right.provider
     && left.planMode === right.planMode
@@ -647,21 +648,65 @@ function wsUrl() {
   return `${protocol}//${window.location.host}/ws`
 }
 
-function useAbolqasemSocket() {
-  const socketRef = useRef<AbolqasemSocket | null>(null)
-  if (!socketRef.current) {
-    socketRef.current = new AbolqasemSocket(wsUrl())
+const TAB_SOCKET_STATE_KEY = "__abolqasemTabSocketState__"
+
+interface TabSocketState {
+  socket: AbolqasemSocket
+  consumers: number
+  disposeTimer: number | null
+}
+
+type WindowWithTabSocket = Window & {
+  [TAB_SOCKET_STATE_KEY]?: TabSocketState
+}
+
+function getTabSocketState() {
+  const socketWindow = window as WindowWithTabSocket
+  const existing = socketWindow[TAB_SOCKET_STATE_KEY]
+  if (existing) return existing
+
+  const created: TabSocketState = {
+    socket: new AbolqasemSocket(wsUrl()),
+    consumers: 0,
+    disposeTimer: null,
   }
+  socketWindow[TAB_SOCKET_STATE_KEY] = created
+  return created
+}
+
+function useAbolqasemSocket() {
+  // The state lives on this browser window, so route remounts, React strict
+  // effects and hot updates cannot create overlapping sockets. Different tabs
+  // still have different Window objects and therefore remain independent.
+  const socketStateRef = useRef<TabSocketState | null>(null)
+  socketStateRef.current ??= getTabSocketState()
 
   useEffect(() => {
-    const socket = socketRef.current
-    socket?.start()
+    const state = socketStateRef.current as TabSocketState
+    state.consumers += 1
+    if (state.disposeTimer !== null) {
+      window.clearTimeout(state.disposeTimer)
+      state.disposeTimer = null
+    }
+    state.socket.start()
     return () => {
-      socket?.dispose()
+      state.consumers = Math.max(0, state.consumers - 1)
+      if (state.consumers > 0 || state.disposeTimer !== null) return
+      // React development mode tears an effect down and immediately restores
+      // it. Deferring disposal by one task lets that remount retain one socket.
+      state.disposeTimer = window.setTimeout(() => {
+        state.disposeTimer = null
+        if (state.consumers > 0) return
+        state.socket.dispose()
+        const socketWindow = window as WindowWithTabSocket
+        if (socketWindow[TAB_SOCKET_STATE_KEY] === state) {
+          delete socketWindow[TAB_SOCKET_STATE_KEY]
+        }
+      }, 0)
     }
   }, [])
 
-  return socketRef.current as AbolqasemSocket
+  return socketStateRef.current.socket
 }
 
 function logAbolqasemState(message: string, details?: unknown) {
@@ -1078,6 +1123,10 @@ export function useAbolqasemState(activeChatId: string | null): AbolqasemState {
   const [optimisticProcessing, setOptimisticProcessing] = useState<OptimisticProcessingState | null>(null)
   const [focusEpoch, setFocusEpoch] = useState(0)
   const creatingChatProjectIdRef = useRef<string | null>(null)
+  const activeHistoryChatIdRef = useRef(activeChatId)
+  const historyPaginationStartedRef = useRef(false)
+  const historyRequestRef = useRef<symbol | null>(null)
+  activeHistoryChatIdRef.current = activeChatId
   const sendToStartingProfilesRef = useRef<Map<string, SendToStartingTrace>>(new Map())
   const pendingArchiveChatIdsRef = useRef<Set<string>>(new Set())
   const draftChatIds = useChatInputStore(useShallow((state) => Object.keys(state.drafts).sort()))
@@ -1364,6 +1413,12 @@ export function useAbolqasemState(activeChatId: string | null): AbolqasemState {
       logAbolqasemState("clearing chat snapshot for non-chat route")
       setChatSnapshot(null)
       setChatReady(true)
+      setOlderHistoryEntries([])
+      setIsHistoryLoading(false)
+      setHistoryCursor(null)
+      setHasOlderHistory(false)
+      historyPaginationStartedRef.current = false
+      historyRequestRef.current = null
       return
     }
 
@@ -1376,6 +1431,12 @@ export function useAbolqasemState(activeChatId: string | null): AbolqasemState {
     })
     setChatSnapshot(null)
     setChatReady(false)
+    setOlderHistoryEntries([])
+    setIsHistoryLoading(false)
+    setHistoryCursor(null)
+    setHasOlderHistory(false)
+    historyPaginationStartedRef.current = false
+    historyRequestRef.current = null
     const unsubscribe = socket.subscribe<ChatSnapshot | null>({ type: "chat", chatId: activeChatId, recentLimit: INITIAL_CHAT_RECENT_LIMIT }, (snapshot) => {
       const normalizedSnapshot = normalizeChatSnapshot(snapshot)
       if (normalizedSnapshot?.runtime.chatId) {
@@ -1405,8 +1466,13 @@ export function useAbolqasemState(activeChatId: string | null): AbolqasemState {
         })
         return reused ? current : normalizedSnapshot
       })
-      setHistoryCursor(normalizedSnapshot?.history.olderCursor ?? null)
-      setHasOlderHistory(normalizedSnapshot?.history.hasOlder ?? false)
+      // A live snapshot always describes the initial tail. Once this tab has
+      // paged backwards, replacing its cursor with that tail cursor makes the
+      // next scroll request fetch the same page forever.
+      if (!historyPaginationStartedRef.current) {
+        setHistoryCursor(normalizedSnapshot?.history.olderCursor ?? null)
+        setHasOlderHistory(normalizedSnapshot?.history.hasOlder ?? false)
+      }
       setChatReady(true)
       setCommandError(null)
     })
@@ -1513,13 +1579,6 @@ export function useAbolqasemState(activeChatId: string | null): AbolqasemState {
       setCommandError(error instanceof Error ? error.message : String(error))
     })
   }, [activeChatId, focusEpoch, sidebarProjectGroups, sidebarReady, socket])
-
-  useEffect(() => {
-    setOlderHistoryEntries([])
-    setIsHistoryLoading(false)
-    setHistoryCursor(null)
-    setHasOlderHistory(false)
-  }, [activeChatId])
 
   const activeChatSnapshot = useMemo(
     () => getActiveChatSnapshot(chatSnapshot, activeChatId),
@@ -1758,47 +1817,69 @@ export function useAbolqasemState(activeChatId: string | null): AbolqasemState {
   }, [optimisticScopeId, serverTranscriptEntries])
 
   const loadOlderHistory = useCallback(async () => {
-    if (!activeChatId || !historyCursor || isHistoryLoading || !hasOlderHistory) {
+    if (!activeChatId || !historyCursor || historyRequestRef.current || !hasOlderHistory) {
       return
     }
 
+    const requestChatId = activeChatId
+    const requestCursor = historyCursor
+    const requestToken = Symbol("chat-history-page")
+    historyRequestRef.current = requestToken
     setIsHistoryLoading(true)
     try {
       const page = await socket.command<ChatHistoryPage>({
         type: "chat.loadHistory",
-        chatId: activeChatId,
-        beforeCursor: historyCursor,
+        chatId: requestChatId,
+        beforeCursor: requestCursor,
         limit: CHAT_HISTORY_PAGE_SIZE,
       })
+      if (activeHistoryChatIdRef.current !== requestChatId || historyRequestRef.current !== requestToken) {
+        return
+      }
+      const nextCursor = page.olderCursor?.trim() || null
+      if (page.hasOlder && nextCursor === requestCursor) {
+        throw new Error("History pagination did not advance")
+      }
+      historyPaginationStartedRef.current = true
       setOlderHistoryEntries((current) => mergeTranscriptEntries(page.messages, current))
-      setHistoryCursor(page.olderCursor)
+      setHistoryCursor(nextCursor)
       setHasOlderHistory(page.hasOlder)
       setCommandError(null)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       setCommandError(message)
     } finally {
-      setIsHistoryLoading(false)
+      if (historyRequestRef.current === requestToken) {
+        historyRequestRef.current = null
+        setIsHistoryLoading(false)
+      }
     }
-  }, [activeChatId, hasOlderHistory, historyCursor, isHistoryLoading, socket])
+  }, [activeChatId, hasOlderHistory, historyCursor, socket])
 
   const loadHistoryAround = useCallback(async (targetCursor: string, limit = CHAT_HISTORY_PAGE_SIZE * 2) => {
     const normalizedTargetCursor = targetCursor.trim()
-    if (!activeChatId || !normalizedTargetCursor || isHistoryLoading) {
+    if (!activeChatId || !normalizedTargetCursor || historyRequestRef.current) {
       return false
     }
 
+    const requestChatId = activeChatId
+    const requestToken = Symbol("chat-history-around")
+    historyRequestRef.current = requestToken
     setIsHistoryLoading(true)
     try {
       const page = await socket.command<ChatHistoryPage>({
         type: "chat.loadHistoryAround",
-        chatId: activeChatId,
+        chatId: requestChatId,
         targetCursor: normalizedTargetCursor,
         limit,
       })
       if (!page.targetFound) {
         return false
       }
+      if (activeHistoryChatIdRef.current !== requestChatId || historyRequestRef.current !== requestToken) {
+        return false
+      }
+      historyPaginationStartedRef.current = true
       setOlderHistoryEntries((current) => mergeTranscriptEntries(page.messages, current))
       setHistoryCursor(page.olderCursor)
       setHasOlderHistory(page.hasOlder)
@@ -1809,9 +1890,12 @@ export function useAbolqasemState(activeChatId: string | null): AbolqasemState {
       setCommandError(message)
       return false
     } finally {
-      setIsHistoryLoading(false)
+      if (historyRequestRef.current === requestToken) {
+        historyRequestRef.current = null
+        setIsHistoryLoading(false)
+      }
     }
-  }, [activeChatId, isHistoryLoading, socket])
+  }, [activeChatId, socket])
 
 	const createChatForProject = useCallback(async (projectId: string) => {
     if (creatingChatProjectIdRef.current) {
@@ -2658,8 +2742,10 @@ export function useAbolqasemState(activeChatId: string | null): AbolqasemState {
     setChatSnapshot((current) =>
       sameChatSnapshotCore(current, snapshot) ? current : snapshot,
     )
-    setHistoryCursor(snapshot.history.olderCursor ?? null)
-    setHasOlderHistory(snapshot.history.hasOlder ?? false)
+    if (!historyPaginationStartedRef.current) {
+      setHistoryCursor(snapshot.history.olderCursor ?? null)
+      setHasOlderHistory(snapshot.history.hasOlder ?? false)
+    }
     setChatReady(true)
     setCommandError(null)
     return snapshot

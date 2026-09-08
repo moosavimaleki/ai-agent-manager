@@ -1036,7 +1036,10 @@ export interface AccountInfoEntry extends TranscriptEntryBase {
 
 export interface AssistantTextEntry extends TranscriptEntryBase {
   kind: "assistant_text";
-  text: string;
+  text?: string;
+  itemId?: string;
+  textDelta?: string;
+  status?: CodexExecutionStatus;
 }
 
 export interface ToolCallEntry extends TranscriptEntryBase {
@@ -1598,6 +1601,8 @@ export type HydratedTranscriptMessage =
   | {
       kind: "assistant_text";
       text: string;
+      itemId?: string;
+      status?: CodexExecutionStatus;
       id: string;
       messageId?: string;
       timestamp: string;
@@ -1746,6 +1751,7 @@ export interface ChatRuntime {
   localPath: string;
   title: string;
   status: AbolqasemStatus;
+  turnStartedAt?: number;
   isDraining: boolean;
   provider: AgentProvider | null;
   planMode: boolean;

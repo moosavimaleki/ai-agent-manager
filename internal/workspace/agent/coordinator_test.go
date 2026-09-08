@@ -546,6 +546,27 @@ func TestTurnEventStreamUpdatesTranscriptSessionAndDraining(t *testing.T) {
 	})
 }
 
+func TestTurnStartedEventPromotesCodexFromStartingToRunning(t *testing.T) {
+	store := newFakeStore()
+	events := make(chan TurnEvent, 1)
+	coordinator := NewCoordinator(store, TurnStarterFunc(func(context.Context, TurnRequest) (Turn, error) {
+		return &fakeTurn{events: events}, nil
+	}), nil)
+
+	if _, err := coordinator.Send(context.Background(), SendCommand{ChatID: "chat-1", Content: "hello", Provider: "codex"}); err != nil {
+		t.Fatalf("Send returned error: %v", err)
+	}
+	if got := coordinator.ActiveStatuses()["chat-1"]; got != readmodels.StatusStarting {
+		t.Fatalf("expected starting before app-server acknowledgement, got %q", got)
+	}
+
+	events <- TurnEvent{Type: TurnEventStarted, SessionToken: "thread-1", TurnID: "turn-1"}
+	waitForCondition(t, func() bool {
+		return coordinator.ActiveStatuses()["chat-1"] == readmodels.StatusRunning
+	})
+	close(events)
+}
+
 func TestTurnEventStreamStartsQueuedMessageAfterClose(t *testing.T) {
 	store := newFakeStore()
 	firstEvents := make(chan TurnEvent)
@@ -855,4 +876,38 @@ func waitForCondition(t *testing.T, condition func() bool) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("condition was not met before timeout")
+}
+
+func TestCoalesceLiveTranscriptEntryBuildsOneStreamingAssistantMessage(t *testing.T) {
+	entries := coalesceLiveTranscriptEntry(nil, readmodels.TranscriptEntry{
+		"kind": "assistant_text", "itemId": "msg-1", "textDelta": "still ", "status": "inProgress",
+	})
+	entries = coalesceLiveTranscriptEntry(entries, readmodels.TranscriptEntry{
+		"kind": "assistant_text", "itemId": "msg-1", "textDelta": "working", "status": "inProgress",
+	})
+	if len(entries) != 1 || entries[0]["text"] != "still working" {
+		t.Fatalf("expected one coalesced assistant message, got %#v", entries)
+	}
+
+	entries = coalesceLiveTranscriptEntry(entries, readmodels.TranscriptEntry{
+		"kind": "assistant_text", "itemId": "msg-1", "text": "done", "status": "completed",
+	})
+	if len(entries) != 1 || entries[0]["text"] != "done" || entries[0]["status"] != "completed" {
+		t.Fatalf("expected completion to replace the streamed text, got %#v", entries)
+	}
+}
+
+func TestCoalesceLiveTranscriptEntryBuildsOneCommandOutput(t *testing.T) {
+	entries := coalesceLiveTranscriptEntry(nil, readmodels.TranscriptEntry{
+		"kind": "command_execution", "itemId": "cmd-1", "command": "go test ./...", "status": "inProgress",
+	})
+	entries = coalesceLiveTranscriptEntry(entries, readmodels.TranscriptEntry{
+		"kind": "command_execution", "itemId": "cmd-1", "outputDelta": "ok ", "status": "inProgress",
+	})
+	entries = coalesceLiveTranscriptEntry(entries, readmodels.TranscriptEntry{
+		"kind": "command_execution", "itemId": "cmd-1", "outputDelta": "done", "status": "inProgress",
+	})
+	if len(entries) != 1 || entries[0]["command"] != "go test ./..." || entries[0]["aggregatedOutput"] != "ok done" {
+		t.Fatalf("expected one coalesced command, got %#v", entries)
+	}
 }

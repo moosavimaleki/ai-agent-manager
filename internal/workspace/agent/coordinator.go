@@ -108,6 +108,16 @@ type ActiveTurn struct {
 	Cancel      context.CancelFunc
 	PendingTool *PendingToolRequest
 	Draining    bool
+	// LiveTranscript keeps the coalesced app-server events that have not yet
+	// appeared in the provider's durable JSONL transcript. Native transcripts
+	// remain the source of truth; this overlay only closes the streaming gap.
+	LiveTranscript []readmodels.TranscriptEntry
+}
+
+type ActiveTurnSnapshot struct {
+	Status         readmodels.AbolqasemStatus
+	StartedAt      time.Time
+	LiveTranscript []readmodels.TranscriptEntry
 }
 
 type PendingToolRequest struct {
@@ -233,6 +243,25 @@ func (c *Coordinator) ActiveStatuses() map[string]readmodels.AbolqasemStatus {
 		statuses[chatID] = turn.Status
 	}
 	return statuses
+}
+
+func (c *Coordinator) ActiveTurnSnapshot(chatID string) (ActiveTurnSnapshot, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	active := c.active[chatID]
+	if active == nil {
+		return ActiveTurnSnapshot{}, false
+	}
+	entries := make([]readmodels.TranscriptEntry, 0, len(active.LiveTranscript))
+	for _, entry := range active.LiveTranscript {
+		entries = append(entries, cloneTranscriptEntry(entry))
+	}
+	return ActiveTurnSnapshot{
+		Status:         active.Status,
+		StartedAt:      active.StartedAt,
+		LiveTranscript: entries,
+	}, true
 }
 
 func (c *Coordinator) DrainingChatIDs() map[string]bool {
@@ -699,6 +728,7 @@ func (c *Coordinator) handleTurnEvent(chatID string, active *ActiveTurn, event T
 	switch event.Type {
 	case TurnEventTranscript:
 		if event.Entry != nil {
+			c.captureLiveTranscriptEntry(chatID, active, event.Entry)
 			if err := c.store.AppendTranscriptEntry(chatID, event.Entry); err != nil {
 				_ = c.failFromProvider(chatID, active, err)
 				return true
@@ -720,6 +750,12 @@ func (c *Coordinator) handleTurnEvent(chatID string, active *ActiveTurn, event T
 				return true
 			}
 		}
+		c.mu.Lock()
+		if c.active[chatID] == active && active.Status == readmodels.StatusStarting {
+			active.Status = readmodels.StatusRunning
+		}
+		c.mu.Unlock()
+		c.emitStateChange(chatID)
 	case TurnEventPendingTool:
 		if event.PendingTool != nil {
 			if err := c.SetPendingTool(chatID, *event.PendingTool); err != nil {
@@ -740,6 +776,109 @@ func (c *Coordinator) handleTurnEvent(chatID string, active *ActiveTurn, event T
 		return true
 	}
 	return false
+}
+
+func (c *Coordinator) captureLiveTranscriptEntry(chatID string, active *ActiveTurn, entry readmodels.TranscriptEntry) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.active[chatID] != active {
+		return
+	}
+	active.LiveTranscript = coalesceLiveTranscriptEntry(active.LiveTranscript, entry)
+}
+
+func coalesceLiveTranscriptEntry(entries []readmodels.TranscriptEntry, incoming readmodels.TranscriptEntry) []readmodels.TranscriptEntry {
+	next := cloneTranscriptEntry(incoming)
+	kind := transcriptEntryString(next, "kind")
+	key := liveTranscriptEntryKey(next)
+	if key == "" {
+		return append(entries, next)
+	}
+	for index := len(entries) - 1; index >= 0; index-- {
+		if liveTranscriptEntryKey(entries[index]) != key {
+			continue
+		}
+		current := entries[index]
+		switch kind {
+		case "assistant_text":
+			if text, ok := next["text"].(string); ok {
+				current["text"] = text
+			} else if delta, ok := next["textDelta"].(string); ok {
+				current["text"] = transcriptEntryString(current, "text") + delta
+			}
+			delete(current, "textDelta")
+			copyTranscriptFields(current, next, "status", "createdAt")
+		case "command_execution":
+			if output, ok := next["aggregatedOutput"].(string); ok {
+				current["aggregatedOutput"] = output
+			} else if delta, ok := next["outputDelta"].(string); ok {
+				current["aggregatedOutput"] = transcriptEntryString(current, "aggregatedOutput") + delta
+			}
+			delete(current, "outputDelta")
+			copyTranscriptFields(current, next, "command", "cwd", "status", "exitCode", "durationMs", "createdAt")
+		case "file_change":
+			if delta, ok := next["outputDelta"].(string); ok {
+				current["outputDelta"] = transcriptEntryString(current, "outputDelta") + delta
+			}
+			copyTranscriptFields(current, next, "status", "changes", "createdAt")
+		default:
+			entries[index] = next
+		}
+		return entries
+	}
+	if kind == "assistant_text" {
+		if delta, ok := next["textDelta"].(string); ok {
+			next["text"] = delta
+			delete(next, "textDelta")
+		}
+	}
+	if kind == "command_execution" {
+		if delta, ok := next["outputDelta"].(string); ok {
+			next["aggregatedOutput"] = delta
+			delete(next, "outputDelta")
+		}
+	}
+	return append(entries, next)
+}
+
+func liveTranscriptEntryKey(entry readmodels.TranscriptEntry) string {
+	kind := transcriptEntryString(entry, "kind")
+	switch kind {
+	case "assistant_text", "command_execution", "file_change":
+		if itemID := transcriptEntryString(entry, "itemId"); itemID != "" {
+			return kind + ":" + itemID
+		}
+	case "turn_activity":
+		return kind + ":" + transcriptEntryString(entry, "turnId")
+	case "context_window_updated", "rate_limit_updated", "model_change", "result":
+		return kind
+	case "tool_result":
+		if toolID := transcriptEntryString(entry, "toolId"); toolID != "" {
+			return kind + ":" + toolID
+		}
+	}
+	return ""
+}
+
+func cloneTranscriptEntry(entry readmodels.TranscriptEntry) readmodels.TranscriptEntry {
+	cloned := make(readmodels.TranscriptEntry, len(entry))
+	for key, value := range entry {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func transcriptEntryString(entry readmodels.TranscriptEntry, key string) string {
+	value, _ := entry[key].(string)
+	return value
+}
+
+func copyTranscriptFields(target readmodels.TranscriptEntry, source readmodels.TranscriptEntry, keys ...string) {
+	for _, key := range keys {
+		if value, ok := source[key]; ok {
+			target[key] = value
+		}
+	}
 }
 
 func (c *Coordinator) finishFromProvider(chatID string, active *ActiveTurn) error {

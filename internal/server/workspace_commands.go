@@ -725,8 +725,11 @@ func workspaceLoadStoredChatHistory(chatID string, beforeCursor string, limit in
 	}
 	page := entries[start:end]
 	var olderCursor *string
-	if start > 0 {
-		cursor := workspaceTranscriptCursor(entries[start-1])
+	if start > 0 && len(page) > 0 {
+		// Cursors are exclusive: the next request loads entries *before* this
+		// page's first entry. Returning entries[start-1] skipped that entry on
+		// every page boundary.
+		cursor := workspaceTranscriptCursor(page[0])
 		olderCursor = &cursor
 	}
 	return map[string]any{
@@ -823,8 +826,6 @@ func workspaceLoadNativeChatHistory(meta state.SessionMeta, beforeCursor string,
 		}
 		if len(window) >= limit {
 			hasOlder = true
-			dropped := workspaceTranscriptCursor(window[0])
-			olderCursor = &dropped
 			window = window[1:]
 		}
 		window = append(window, workspaceTranscriptEntryFromSearchable(message))
@@ -832,6 +833,10 @@ func workspaceLoadNativeChatHistory(meta state.SessionMeta, beforeCursor string,
 	})
 	if err != nil {
 		return nil, err
+	}
+	if hasOlder && len(window) > 0 {
+		cursor := workspaceTranscriptCursor(window[0])
+		olderCursor = &cursor
 	}
 	page := map[string]any{
 		"messages":    window,
@@ -956,8 +961,6 @@ func workspaceLoadNativeChatHistoryAround(meta state.SessionMeta, targetCursor s
 		}
 		if len(before) >= beforeLimit {
 			hasOlder = true
-			dropped := workspaceTranscriptCursor(before[0])
-			olderCursor = &dropped
 			before = before[1:]
 		}
 		before = append(before, entry)
@@ -973,6 +976,10 @@ func workspaceLoadNativeChatHistoryAround(meta state.SessionMeta, targetCursor s
 			"olderCursor": nil,
 			"targetFound": false,
 		}, nil
+	}
+	if hasOlder && len(messages) > 0 {
+		cursor := workspaceTranscriptCursor(messages[0])
+		olderCursor = &cursor
 	}
 	return map[string]any{
 		"messages":    messages,

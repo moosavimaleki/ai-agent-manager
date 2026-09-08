@@ -19,14 +19,15 @@ import (
 )
 
 const (
-	sidebarSubscription       = "__sidebar__"
-	localProjectsSubscription = "__local_projects__"
-	updateSubscription        = "__update__"
-	appSettingsSubscription   = "__app_settings__"
-	globalEventsSubscription  = "__global_events__"
-	terminalSubscription      = "terminal:"
-	chatSubscription          = "chat:"
-	projectGitSubscription    = "project_git:"
+	sidebarSubscription               = "__sidebar__"
+	localProjectsSubscription         = "__local_projects__"
+	updateSubscription                = "__update__"
+	appSettingsSubscription           = "__app_settings__"
+	globalEventsSubscription          = "__global_events__"
+	terminalSubscription              = "terminal:"
+	chatSubscription                  = "chat:"
+	projectGitSubscription            = "project_git:"
+	workspaceChatBroadcastMinInterval = 150 * time.Millisecond
 )
 
 var (
@@ -44,21 +45,23 @@ type workspaceEventStore struct {
 }
 
 type workspaceConnectionRegistry struct {
-	mu               sync.Mutex
-	connections      map[*workspaceConnection]struct{}
-	subscribers      map[string]map[*workspaceConnection]map[string]struct{}
-	broadcastPending map[string]bool
-	broadcastRunning map[string]bool
-	chatStatuses     map[string]readmodels.AbolqasemStatus
+	mu                sync.Mutex
+	connections       map[*workspaceConnection]struct{}
+	subscribers       map[string]map[*workspaceConnection]map[string]struct{}
+	broadcastPending  map[string]bool
+	broadcastRunning  map[string]bool
+	lastChatBroadcast map[string]time.Time
+	chatStatuses      map[string]readmodels.AbolqasemStatus
 }
 
 func newWorkspaceConnectionRegistry() *workspaceConnectionRegistry {
 	return &workspaceConnectionRegistry{
-		connections:      map[*workspaceConnection]struct{}{},
-		subscribers:      map[string]map[*workspaceConnection]map[string]struct{}{},
-		broadcastPending: map[string]bool{},
-		broadcastRunning: map[string]bool{},
-		chatStatuses:     map[string]readmodels.AbolqasemStatus{},
+		connections:       map[*workspaceConnection]struct{}{},
+		subscribers:       map[string]map[*workspaceConnection]map[string]struct{}{},
+		broadcastPending:  map[string]bool{},
+		broadcastRunning:  map[string]bool{},
+		lastChatBroadcast: map[string]time.Time{},
+		chatStatuses:      map[string]readmodels.AbolqasemStatus{},
 	}
 }
 
@@ -96,7 +99,14 @@ func (r *workspaceConnectionRegistry) scheduleBroadcast(chatID string) {
 				r.mu.Unlock()
 				return
 			}
+			if wait := time.Until(r.lastChatBroadcast[chatID].Add(workspaceChatBroadcastMinInterval)); wait > 0 {
+				r.mu.Unlock()
+				timer := time.NewTimer(wait)
+				<-timer.C
+				continue
+			}
 			delete(r.broadcastPending, chatID)
+			r.lastChatBroadcast[chatID] = time.Now()
 			r.mu.Unlock()
 			r.broadcastChat(chatID)
 		}

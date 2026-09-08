@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,8 @@ import (
 	"abolqasem/internal/workspace/legacyimport"
 	"abolqasem/internal/workspace/protocol"
 	"abolqasem/internal/workspace/readmodels"
+
+	"github.com/gorilla/websocket"
 )
 
 func TestWorkspaceNativeHistoryCacheUsesStatAndDoesNotExposeCachedPayload(t *testing.T) {
@@ -466,6 +469,63 @@ func TestWorkspaceRefreshDiffsCommandRunsAsync(t *testing.T) {
 	}
 }
 
+func TestWorkspaceChatRefreshOnlySendsSnapshotToRequestingTab(t *testing.T) {
+	withWorkspaceComposerStore(t)
+	ownerWrites := 0
+	otherTabWrites := 0
+	owner := newTestWorkspaceConnection(func(envelope protocol.ServerEnvelope) error {
+		if envelope.Type == protocol.EnvelopeSnapshot && envelope.Snapshot != nil && envelope.Snapshot.Type == protocol.SnapshotChat {
+			ownerWrites++
+		}
+		return nil
+	})
+	otherTab := newTestWorkspaceConnection(func(envelope protocol.ServerEnvelope) error {
+		if envelope.Type == protocol.EnvelopeSnapshot && envelope.Snapshot != nil && envelope.Snapshot.Type == protocol.SnapshotChat {
+			otherTabWrites++
+		}
+		return nil
+	})
+	projectID := mustCreateWorkspaceProject(t, owner, t.TempDir())
+	chatID := mustCreateWorkspaceChat(t, owner, projectID)
+	recentLimit := 50
+	topic := protocol.SubscriptionTopic{Type: protocol.TopicChat, ChatID: chatID, RecentLimit: &recentLimit}
+	owner.subscribe("owner-chat", chatSubscription+chatID, topic)
+	otherTab.subscribe("other-chat", chatSubscription+chatID, topic)
+	t.Cleanup(owner.close)
+	t.Cleanup(otherTab.close)
+
+	response := owner.handleCommand(protocol.ClientEnvelope{
+		V:    protocol.ProtocolVersion,
+		Type: protocol.EnvelopeCommand,
+		ID:   "refresh-owner",
+		Command: mustWorkspaceRawCommand(t, map[string]any{
+			"type":   protocol.CommandChatRefresh,
+			"chatId": chatID,
+		}),
+	})
+	assertWorkspaceAck(t, response, "refresh-owner")
+	if ownerWrites != 1 {
+		t.Fatalf("expected one refreshed snapshot for requesting tab, got %d", ownerWrites)
+	}
+	if otherTabWrites != 0 {
+		t.Fatalf("expected polling refresh not to fan out to another tab, got %d snapshots", otherTabWrites)
+	}
+
+	secondResponse := owner.handleCommand(protocol.ClientEnvelope{
+		V:    protocol.ProtocolVersion,
+		Type: protocol.EnvelopeCommand,
+		ID:   "refresh-owner-again",
+		Command: mustWorkspaceRawCommand(t, map[string]any{
+			"type":   protocol.CommandChatRefresh,
+			"chatId": chatID,
+		}),
+	})
+	assertWorkspaceAck(t, secondResponse, "refresh-owner-again")
+	if ownerWrites != 1 {
+		t.Fatalf("expected repeated polling inside the throttle window to reuse current state, got %d snapshots", ownerWrites)
+	}
+}
+
 func TestWorkspaceRefreshDiffsBroadcastsSnapshotEvenWhenUnchanged(t *testing.T) {
 	withWorkspaceComposerStore(t)
 	withWorkspaceConnectionRegistry(t)
@@ -581,6 +641,102 @@ func TestWorkspaceSubscriptionRegistryBroadcastsOnlyRelatedTopics(t *testing.T) 
 	}
 	if len(sidebarEnvelopes) != 1 {
 		t.Fatalf("sidebar subscriber received unrelated update broadcast: %#v", sidebarEnvelopes)
+	}
+}
+
+func TestWorkspaceConnectionRegistryBroadcastsToEachIndependentTab(t *testing.T) {
+	registry := newWorkspaceConnectionRegistry()
+	const tabCount = 48
+	received := make([][]protocol.ServerEnvelope, tabCount)
+
+	for index := range tabCount {
+		index := index
+		conn := &workspaceConnection{
+			writeFn: func(envelope protocol.ServerEnvelope) error {
+				received[index] = append(received[index], envelope)
+				return nil
+			},
+			subscriptions: map[string]workspaceSubscription{},
+		}
+		registry.add(conn)
+		registry.subscribe(sidebarSubscription, "tab-"+strconv.Itoa(index), conn)
+	}
+
+	registry.broadcastTopic(sidebarSubscription, protocol.SnapshotSidebar, map[string]any{"revision": 1})
+	for index, envelopes := range received {
+		if len(envelopes) != 1 {
+			t.Fatalf("tab %d received %d snapshots, want one", index, len(envelopes))
+		}
+		if envelopes[0].ID != "tab-"+strconv.Itoa(index) {
+			t.Fatalf("tab %d received a snapshot for %q", index, envelopes[0].ID)
+		}
+	}
+}
+
+func TestWorkspaceConnectionBackpressureClosesOnlyTheSlowTab(t *testing.T) {
+	conn := &workspaceConnection{
+		outbound: make(chan protocol.ServerEnvelope, 1),
+		done:     make(chan struct{}),
+	}
+	conn.outbound <- protocol.AckEnvelope("already-queued", nil)
+
+	started := time.Now()
+	err := conn.write(protocol.AckEnvelope("must-not-block", nil))
+	if err != errWorkspaceConnectionBackpressure {
+		t.Fatalf("expected backpressure error, got %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("slow tab blocked the caller for %s", elapsed)
+	}
+	select {
+	case <-conn.done:
+	default:
+		t.Fatal("expected only the slow tab connection to close")
+	}
+}
+
+func TestWorkspaceWebSocketSupportsIndependentBrowserTabs(t *testing.T) {
+	withWorkspaceConnectionRegistry(t)
+	server := httptest.NewServer(http.HandlerFunc(handleWorkspaceWS))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	const tabCount = 16
+	connections := make([]*websocket.Conn, 0, tabCount)
+	for index := range tabCount {
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+		if err != nil {
+			t.Fatalf("tab %d could not connect: %v", index, err)
+		}
+		connections = append(connections, conn)
+	}
+	defer func() {
+		for _, conn := range connections {
+			_ = conn.Close()
+		}
+	}()
+
+	for index, conn := range connections {
+		id := "tab-" + strconv.Itoa(index)
+		if err := conn.WriteJSON(protocol.ClientEnvelope{
+			V:       protocol.ProtocolVersion,
+			Type:    protocol.EnvelopeCommand,
+			ID:      id,
+			Command: mustWorkspaceRawCommand(t, map[string]any{"type": protocol.CommandSystemPing}),
+		}); err != nil {
+			t.Fatalf("tab %d could not send ping: %v", index, err)
+		}
+	}
+	for index, conn := range connections {
+		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+		var response protocol.ServerEnvelope
+		if err := conn.ReadJSON(&response); err != nil {
+			t.Fatalf("tab %d did not receive an ACK: %v", index, err)
+		}
+		id := "tab-" + strconv.Itoa(index)
+		if response.Type != protocol.EnvelopeAck || response.ID != id {
+			t.Fatalf("tab %d received %#v, want ACK %q", index, response, id)
+		}
 	}
 }
 

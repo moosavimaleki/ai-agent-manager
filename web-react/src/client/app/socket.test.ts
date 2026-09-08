@@ -114,36 +114,6 @@ class FakeWebSocket {
   }
 }
 
-class FakeMessagePort extends FakeEventTarget {
-  readonly sent: unknown[] = []
-  closed = false
-
-  start() {}
-
-  postMessage(message: unknown) {
-    this.sent.push(message)
-  }
-
-  close() {
-    this.closed = true
-  }
-}
-
-class FakeSharedWorker {
-  static instances: FakeSharedWorker[] = []
-
-  readonly port = new FakeMessagePort()
-
-  constructor(
-    readonly url: URL,
-    readonly options?: string | WorkerOptions
-  ) {
-    FakeSharedWorker.instances.push(this)
-  }
-
-  addEventListener() {}
-}
-
 describe("AbolqasemSocket", () => {
   let windowTarget: FakeEventTarget
   let documentTarget: FakeEventTarget & { visibilityState: "visible" | "hidden" }
@@ -188,6 +158,22 @@ describe("AbolqasemSocket", () => {
     socket.dispose()
   })
 
+  test("opens an independent direct WebSocket for each browser tab", () => {
+    const firstTab = new AbolqasemSocket("ws://localhost/ws")
+    const secondTab = new AbolqasemSocket("ws://localhost/ws")
+
+    firstTab.start()
+    secondTab.start()
+
+    expect(FakeWebSocket.instances).toHaveLength(2)
+    expect(FakeWebSocket.instances.map((socket) => socket.url)).toEqual([
+      "ws://localhost/ws",
+      "ws://localhost/ws",
+    ])
+    firstTab.dispose()
+    secondTab.dispose()
+  })
+
   test("abandons a WebSocket that stays connecting instead of waiting for the browser timeout", () => {
     const statuses: string[] = []
     const socket = new AbolqasemSocket("ws://localhost/ws")
@@ -203,37 +189,6 @@ describe("AbolqasemSocket", () => {
     const reconnectTimerId = (socket as any).reconnectTimer as number
     timers.runTimeout(reconnectTimerId)
     expect(FakeWebSocket.instances).toHaveLength(2)
-    socket.dispose()
-  })
-
-  test("uses an anonymous SharedWorker so a deploy cannot reuse the previous named worker", () => {
-    FakeSharedWorker.instances = []
-    restoreGlobals.push(replaceGlobalProperty("SharedWorker", FakeSharedWorker))
-    const socket = new AbolqasemSocket("ws://localhost/ws")
-
-    socket.start()
-
-    const worker = FakeSharedWorker.instances[0]!
-    expect(worker.options).toEqual({ type: "module" })
-    expect(typeof worker.options === "object" && worker.options?.name).toBeUndefined()
-    expect(worker.port.sent[0]).toEqual({ type: "start", url: "ws://localhost/ws" })
-    socket.dispose()
-    expect(worker.port.closed).toBe(true)
-  })
-
-  test("falls back to a direct socket when a SharedWorker does not connect promptly", () => {
-    FakeSharedWorker.instances = []
-    restoreGlobals.push(replaceGlobalProperty("SharedWorker", FakeSharedWorker))
-    const socket = new AbolqasemSocket("ws://localhost/ws")
-    socket.start()
-    const worker = FakeSharedWorker.instances[0]!
-    const workerTimeoutId = (socket as any).connectTimeoutTimer as number
-
-    timers.runTimeout(workerTimeoutId)
-
-    expect(worker.port.closed).toBe(true)
-    expect(FakeWebSocket.instances).toHaveLength(1)
-    expect(FakeWebSocket.instances[0]?.url).toBe("ws://localhost/ws")
     socket.dispose()
   })
 

@@ -341,7 +341,7 @@ export function tmuxCaptureToTranscriptMessages(entry: Extract<TranscriptEntry, 
     assistantLines = []
   }
 
-  for (const rawLine of tmuxCaptureLines(entry.text)) {
+  for (const rawLine of tmuxCaptureLines(entry.text ?? "")) {
     const line = rawLine.trimEnd()
     const trimmed = line.trim()
 
@@ -377,7 +377,7 @@ export function tmuxCaptureToTranscriptMessages(entry: Extract<TranscriptEntry, 
   flushAssistant()
 
   if (messages.length === 0) {
-    const text = tmuxCaptureToReadableText(entry.text)
+    const text = tmuxCaptureToReadableText(entry.text ?? "")
     if (text) {
       messages.push({
         ...createBaseMessage(entry),
@@ -418,6 +418,7 @@ function getStructuredToolResultFromDebug(entry: Extract<TranscriptEntry, { kind
 export function processTranscriptMessages(entries: TranscriptEntry[]): HydratedTranscriptMessage[] {
   const pendingToolCalls = new Map<string, { hydrated: HydratedToolCall; normalized: NormalizedToolCall }>()
   const messages: HydratedTranscriptMessage[] = []
+  const assistantTexts = new Map<string, Extract<HydratedTranscriptMessage, { kind: "assistant_text" }>>()
   const commandExecutions = new Map<string, Extract<HydratedTranscriptMessage, { kind: "command_execution" }>>()
   const fileChanges = new Map<string, Extract<HydratedTranscriptMessage, { kind: "file_change" }>>()
   const turnPlans = new Map<string, Extract<HydratedTranscriptMessage, { kind: "turn_plan" }>>()
@@ -468,9 +469,9 @@ export function processTranscriptMessages(entries: TranscriptEntry[]): HydratedT
           accountInfo: entry.accountInfo,
         })
         break
-      case "assistant_text":
-        {
-          const visibleText = stripInternalAssistantMetadata(entry.text)
+      case "assistant_text": {
+          const rawText = entry.text ?? entry.textDelta ?? ""
+          const visibleText = stripInternalAssistantMetadata(rawText)
           if (!visibleText) break
           // Recent Codex versions can persist internal payloads both as a
           // user_message event and as an assistant text echo. Keep one
@@ -480,13 +481,27 @@ export function processTranscriptMessages(entries: TranscriptEntry[]): HydratedT
             if (internalSystemPayloads.has(systemPayload.dedupeKey)) break
             internalSystemPayloads.add(systemPayload.dedupeKey)
           }
-        }
-        messages.push({
-          ...createBaseMessage(entry),
-          kind: "assistant_text",
-          text: stripInternalAssistantMetadata(entry.text),
-        })
-        break
+          if (entry.itemId) {
+            const existing = assistantTexts.get(entry.itemId)
+            if (existing) {
+              existing.text = entry.text !== undefined
+                ? stripInternalAssistantMetadata(entry.text)
+                : stripInternalAssistantMetadata(existing.text + (entry.textDelta ?? ""))
+              existing.status = entry.status
+              break
+            }
+          }
+          const assistant = {
+            ...createBaseMessage(entry),
+            kind: "assistant_text" as const,
+            text: stripInternalAssistantMetadata(rawText),
+            itemId: entry.itemId,
+            status: entry.status,
+          }
+          if (entry.itemId) assistantTexts.set(entry.itemId, assistant)
+          messages.push(assistant)
+          break
+      }
       case "tool_call": {
         const toolCall = hydrateToolCall(entry)
         pendingToolCalls.set(entry.tool.toolId, { hydrated: toolCall, normalized: entry.tool })

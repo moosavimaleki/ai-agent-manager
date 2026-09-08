@@ -865,9 +865,11 @@ func workspaceSliceTranscriptEntriesAround(entries []readmodels.TranscriptEntry,
 	if start == 0 || len(sliced) == 0 {
 		return sliced, false, nil, true
 	}
-	cursor := workspaceTranscriptCursor(entries[start-1])
+	// The cursor is exclusive. Point at the first returned entry so the next
+	// page includes the entry immediately before this slice.
+	cursor := workspaceTranscriptCursor(entries[start])
 	if strings.TrimSpace(cursor) == "" {
-		cursor = strconv.Itoa(start)
+		cursor = strconv.Itoa(start + 1)
 	}
 	return sliced, true, &cursor, true
 }
